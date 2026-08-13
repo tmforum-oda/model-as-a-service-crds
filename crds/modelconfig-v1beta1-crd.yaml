@@ -108,12 +108,9 @@ spec:
               description: "Desired state of the governed model: identity (alias/provider/modelId), capabilities, safety enforcer, governance, and provider-specific config."
               required: ["alias", "provider", "modelId"]
               x-kubernetes-validations:
-                # ── Credential handling: REFERENCED, never inline (G50) ──
-                # The credentialSecretRef description already said "Credentials NEVER inline in CRD".
-                # A description is documentation, not a guardrail — nothing rejected a violation, so an
-                # API_KEY asset could be admitted with no secret reference at all and the operator would
-                # discover it at reconcile time, or worse a caller could stuff the key somewhere else.
-                # These rules make the API refuse it.
+                # ── Credential handling: referenced, never inline ──
+                # Admission rules enforce that API_KEY/OAUTH assets reference a Secret;
+                # credential material is never carried inline in the resource.
                 - rule: "!(self.credentialProviderType in ['API_KEY','OAUTH']) || (has(self.credentialSecretRef) && self.credentialSecretRef != '')"
                   message: "credentialProviderType API_KEY or OAUTH requires spec.credentialSecretRef — credentials are REFERENCED from a Secret, never inline"
                 # A secret ref with no credential type is a contradiction: it declares a credential the
@@ -907,31 +904,25 @@ spec:
                 #   promoted into the status schema. Until then this is
                 #   operator-owned (claim sets condition only after provisioning succeeds).
               properties:
-                # ── kopf handler results ─────────────────────────────────────────────
-                # kopf persists each handler's RETURN VALUE at status.<handler_id>. These were not
-                # declared, and status has no x-kubernetes-preserve-unknown-fields, so the API stripped
-                # them and every reconcile logged:
-                #   Patching failed with inconsistencies: (('remove', ('status','reconcile'), ...))
-                # That warning is identical whether the dropped field is kopf bookkeeping or a field the
-                # operator genuinely meant to publish, so a constant benign version of it cannot warn about
-                # the dangerous one. Declared explicitly rather than via preserve-unknown-fields so a
-                # genuinely mistyped status key still gets rejected.
+                # ── Operator handler diagnostics ──
+                # Status fields where the reconciling operator publishes per-handler results.
+                # Declared explicitly (not preserve-unknown-fields) so mistyped status keys are rejected.
                 reconcile:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
-                  description: kopf handler result for reconcile() — diagnostic, not API surface.
+                  description: Operator handler result for reconcile() — diagnostic, not API surface.
                 resync_from_registry:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
-                  description: kopf handler result for resync_from_registry() — diagnostic, not API surface.
+                  description: Operator handler result for resync_from_registry() — diagnostic, not API surface.
                 scan_orphan_records:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
-                  description: kopf handler result for scan_orphan_records() — diagnostic, not API surface.
+                  description: Operator handler result for scan_orphan_records() — diagnostic, not API surface.
                 cleanup:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
-                  description: kopf handler result for cleanup() — diagnostic, not API surface.
+                  description: Operator handler result for cleanup() — diagnostic, not API surface.
                 phase:
                   type: string
                   # Pending + Reviewing support the governance approval gate.
