@@ -1,0 +1,118 @@
+---
+# =============================================================================
+# Registry CRD v1beta1
+# Data-only CRD — no reconcile loop. Referenced by ModelConfig/ToolConfig/
+# AgentConfig via spec.registryRef.name. Asset operators resolve references at
+# reconcile time and dispatch to the correct backing plugin.
+#
+# Follows K8s precedent: StorageClass (provisioner+parameters), IngressClass
+# (controller field filter), GatewayClass (controllerName + parametersRef).
+# =============================================================================
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: registries.oda.tmforum.org
+  labels:
+    app.kubernetes.io/part-of: modaas
+    oda.tmforum.org/component-type: governance
+  annotations:
+    modaas.tmforum.org/design-pattern: "k8s-storageclass-ingressclass-gatewayclass"
+spec:
+  group: oda.tmforum.org
+  scope: Namespaced
+  names:
+    plural: registries
+    singular: registry
+    kind: Registry
+    shortNames: [reg]
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: "Selects WHERE governed assets (ModelConfig/ToolConfig/AgentConfig) publish their discovery records — the backing-selector for MoDaaS, following the Kubernetes StorageClass / IngressClass pattern. NOT a fourth governed asset: it picks a catalog backing (AWS Agent Registry, Canvas TMF639 Resource Inventory, or an in-memory stub) and the operator dispatches projection through the matching plugin. An asset's registryRef names a Registry; that Registry's `backing` decides which catalog the record lands in. Realizes GB1085 §4 Registration-and-Discovery (optional pattern)."
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [controller, backing]
+              # ── Admission invariants. A contributed CRD must carry
+              #    admission-safety CEL, not just shape. Registry is the
+              #    StorageClass-pattern backing-selector; like StorageClass's
+              #    immutable provisioner, controller+backing are fixed after
+              #    creation (re-pointing a Registry's backing would silently
+              #    re-home every asset that references it). ──
+              x-kubernetes-validations:
+                - rule: "oldSelf.controller == self.controller"
+                  message: "spec.controller is immutable after creation (re-homing a Registry's owning operator is not a safe in-place mutation; create a new Registry instead)"
+                - rule: "oldSelf.backing == self.backing"
+                  message: "spec.backing is immutable after creation (changing the backing would orphan every asset that published to the old backing; create a new Registry instead)"
+                # Known backings that require connection parameters must declare them.
+                # in-memory is the only known backing that needs none. Unknown
+                # (third-party) backings are unconstrained — sibling operators own them.
+                - rule: "self.backing != 'agentcore' || has(self.parameters)"
+                  message: "backing=agentcore requires spec.parameters (e.g. registryName, region)"
+                - rule: "self.backing != 'tmf639' || has(self.parameters)"
+                  message: "backing=tmf639 requires spec.parameters (e.g. baseUrl)"
+              properties:
+                controller:
+                  type: string
+                  description: |
+                    Controller identifier that owns this Registry, following
+                    the IngressClass/GatewayClass precedent. Operators filter
+                    by this field and ignore Registries owned by others.
+                    Example: 'aws-model-operator.modaas' (reference impl).
+                  pattern: "^[a-z][a-z0-9.-]{0,127}$"
+                  maxLength: 128
+                backing:
+                  type: string
+                  description: |
+                    Registry backing implementation identifier. The operator
+                    dispatches to the backing plugin registered under this key.
+                    Known values: 'agentcore' (AWS AgentCore Registry),
+                    'tmf639' (Canvas TMF639 Resource Inventory v5 peer),
+                    'in-memory' (test double).
+                    Third parties register their own via sibling operators.
+                  pattern: "^[a-z][a-z0-9-]{0,63}$"
+                  maxLength: 64
+                parameters:
+                  type: object
+                  description: |
+                    Free-form backing-specific parameters (StorageClass
+                    convention). Pass-through to the backing plugin.
+                    Common keys by backing:
+                      agentcore: {registryName, region, roleArn?}
+                      tmf639:    {baseUrl, timeout?}
+                      in-memory: {}
+                  x-kubernetes-preserve-unknown-fields: true
+                description:
+                  type: string
+                  maxLength: 512
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Ready, Degraded, Unreachable, Unknown, ReadOnly]
+                  description: "Observed reachability — written by periodic health probe if enabled. ReadOnly indicates a read-only backing (e.g. a TMF639 Resource Inventory peer view) that is reachable but does not accept record writes."
+                lastProbed:
+                  type: string
+                  format: date-time
+                recordCount:
+                  type: integer
+                  description: "Observed count of APPROVED records in this backing (probe filters by approval state). For a read-only backing (e.g. a TMF639 Resource Inventory peer view) this reflects what the peer exposes, which may not be the full set."
+                message:
+                  type: string
+                  maxLength: 1024
+              x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - { name: Controller, type: string, jsonPath: .spec.controller }
+        - { name: Backing,    type: string, jsonPath: .spec.backing }
+        - { name: Phase,      type: string, jsonPath: .status.phase }
+        - { name: Records,    type: integer, jsonPath: .status.recordCount, priority: 1 }
+        - { name: LastProbed, type: date,   jsonPath: .status.lastProbed,   priority: 1 }
+        - { name: Age,        type: date,   jsonPath: .metadata.creationTimestamp }

@@ -1,0 +1,1069 @@
+# AgentConfig — Open-contract CRD for ODA Canvas agent lifecycle
+# =============================================================================
+# Namespace-scoped CRD declaring one A2A-speaking agent's identity, agent card,
+# runtime backing, dependencies, and access controls.
+#
+# Runtime providers: awsAgentCore (managed AgentCore Runtime) + kubernetesPod (dual-provider hosting).
+# CEL rules enforce exactly-one typed block matching spec.provider, plus
+# immutability of the identity pair {agentName, provider}.
+#
+# Extension protocol: add one typed sub-block + one CEL rule pair.
+# =============================================================================
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: agentconfigs.oda.tmforum.org
+  labels:
+    app.kubernetes.io/part-of: modaas-canvas
+  annotations:
+    oda.tmforum.org/crd-version: "v1beta1"
+    # Declarative spec lineage — ties this CRD to the TMF specification it
+    # realizes, the way ODA Canvas CRDs cite TMF6xx / SID. MoDaaS is the first
+    # concrete implementation of GB1085 §4 Canvas Operator Requirements.
+    oda.tmforum.org/spec-sdo: "TMForum"
+    oda.tmforum.org/specification: "GB1085 Model-as-a-Service v1.0.0"
+    oda.tmforum.org/spec-section: "§1.3.1 Agent Developer enablement + §4 Canvas Operator Requirements"
+    oda.tmforum.org/governed-asset: "agent"
+spec:
+  group: oda.tmforum.org
+  scope: Namespaced
+  names:
+    plural: agentconfigs
+    singular: agentconfig
+    kind: AgentConfig
+    shortNames: [ac]
+    categories: [oda, modaas]
+  conversion:
+    strategy: None
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: "Registers and governs one AI agent (an LLM-driven service that calls models and tools) and reconciles it into a runtime backend. An operator hosts the agent on AWS Bedrock AgentCore Runtime (an AWS managed service for running agents) or as an in-cluster Kubernetes Deployment+Service. Captures the agent's identity, its public capability descriptor (the 'agent card', used for A2A = Agent-to-Agent discovery), the models/tools it depends on (cross-asset gate), a safety attestation, and an approval+lifecycle state machine; publishes a TMF639 discovery record. Open contract: dual-provider [awsAgentCore, kubernetesPod] with an open provider pattern — any framework via a sibling operator, no CRD bump. Runs on ODA Canvas (TM Forum's open telco-platform framework); realizes GB1085 §1.3.1 Agent Developer enablement + §4 Canvas Operator Requirements."
+          required: ["spec"]
+          x-kubernetes-validations:
+            # Governance approval gate invariants
+            - rule: |
+                !has(self.status) || !has(self.status.phase) || self.status.phase != 'Approved'
+                || !has(self.spec.governance) || !has(self.spec.governance.approval)
+                || !has(self.spec.governance.approval.required)
+                || self.spec.governance.approval.required != true
+                || (has(self.status.governance) && has(self.status.governance.approvals)
+                    && size(self.status.governance.approvals) >=
+                       (has(self.spec.governance.approval.requiredApprovals) ? self.spec.governance.approval.requiredApprovals : 1))
+              message: "phase=Approved with governance.approval.required=true requires at least requiredApprovals signed attestations in status.governance.approvals[] (governance approval gate)."
+            # Grandfather transition rule — demands approval only when the
+            # safety-enforcement posture is newly set (create) or changed
+            # (update). Pre-existing agents with unchanged safety are
+            # grandfathered, so admission never rejects an already-Approved
+            # agent on re-apply (admission fires before the operator's
+            # approval-satisfied grandfather can run).
+            - rule: |
+                !(has(self.spec.safety) && has(self.spec.safety.enforces) && self.spec.safety.enforces == true)
+                || (oldSelf.hasValue() && has(oldSelf.value().spec.safety) && oldSelf.value().spec.safety == self.spec.safety)
+                || (has(self.spec.governance) && has(self.spec.governance.approval)
+                    && has(self.spec.governance.approval.required)
+                    && self.spec.governance.approval.required == true)
+              optionalOldSelf: true
+              message: "spec.safety.enforces=true demands spec.governance.approval.required=true (no silent auto-approve). Pre-existing agents with unchanged safety are grandfathered."
+            - rule: |
+                !has(self.status) || !has(self.status.governance)
+                || !has(self.status.governance.approvals)
+                || !has(self.spec.governance) || !has(self.spec.governance.approval)
+                || !has(self.spec.governance.approval.approverRole)
+                || self.status.governance.approvals.all(a, !has(a.role) || a.role == self.spec.governance.approval.approverRole)
+              message: "every status.governance.approvals[].role must match spec.governance.approval.approverRole (governance approval gate)."
+          properties:
+            spec:
+              type: object
+              description: "Desired state of the governed agent: identity (agentName/provider), agent card, dependencies, safety attestation, and provider-specific hosting config."
+              required: ["agentName", "provider", "agentCard"]
+              x-kubernetes-validations:
+                # ── Provider requirement (dual-provider hosting) ──
+                - rule: "self.provider != 'awsAgentCore' || has(self.awsAgentCore)"
+                  message: "provider=awsAgentCore requires spec.awsAgentCore block"
+                - rule: "self.provider != 'kubernetesPod' || has(self.kubernetesPod)"
+                  message: "provider=kubernetesPod requires the spec.kubernetesPod block (dual-provider hosting)"
+                # Mutual exclusion — exactly one provider block matching spec.provider
+                - rule: |
+                    !(has(self.kubernetesPod) && has(self.awsAgentCore))
+                  message: "spec.kubernetesPod and spec.awsAgentCore are mutually exclusive; set exactly one matching spec.provider (dual-provider hosting)"
+                - rule: |
+                    !has(self.kubernetesPod) || self.provider == 'kubernetesPod'
+                  message: "spec.kubernetesPod is only valid when spec.provider='kubernetesPod' (dual-provider hosting)"
+                # ── Network posture — provider-dispatched (neutrality fix) ──
+                # The AWS subnet/securityGroup requirement applies ONLY to
+                # provider=awsAgentCore. A kubernetesPod (or any non-AWS) agent
+                # in VPC/PRIVATE mode must NOT be forced to carry AWS-shaped
+                # networkModeConfig — otherwise the rule is structurally
+                # unsatisfiable for non-AWS providers and silently forces them
+                # to networkMode=PUBLIC (the escape-hatch-tenant anti-pattern).
+                - rule: |
+                    !(has(self.networkMode) && (self.networkMode == 'VPC' || self.networkMode == 'PRIVATE'))
+                    || self.provider != 'awsAgentCore'
+                    || (has(self.awsAgentCore) && has(self.awsAgentCore.networkModeConfig)
+                        && has(self.awsAgentCore.networkModeConfig.subnets)
+                        && has(self.awsAgentCore.networkModeConfig.securityGroups))
+                  message: "networkMode=VPC|PRIVATE with provider=awsAgentCore requires awsAgentCore.networkModeConfig with subnets and securityGroups"
+                # ── Immutability ──
+                - rule: "oldSelf.provider == self.provider"
+                  message: "spec.provider is immutable after creation"
+                - rule: "oldSelf.agentName == self.agentName"
+                  message: "spec.agentName is immutable after creation"
+                # registryRef selects the discovery-catalog backing (Registry CR).
+                # Immutable after creation: silently re-homing an asset's records
+                # to a different catalog would orphan the prior registry's records
+                # and break audit provenance. Optional field, guard both has() sides.
+                - rule: "!has(oldSelf.registryRef) || !has(self.registryRef) || oldSelf.registryRef == self.registryRef"
+                  message: "spec.registryRef is immutable after creation"
+                # ── Cross-vendor neutrality rules ──
+                - rule: "!has(self.modelRef) || !has(self.dependsOn) || !has(self.dependsOn.models) || self.modelRef in self.dependsOn.models"
+                  message: "spec.modelRef must appear in spec.dependsOn.models for cross-asset dep gate to resolve"
+                # toolRefs ⊆ dependsOn.tools enforced at admission.
+                # The K8s 1.30+ cost budget accommodates self.toolRefs.all() over maxItems:50.
+                # An operator-side check remains as defense-in-depth.
+                - rule: "!has(self.toolRefs) || !has(self.dependsOn) || !has(self.dependsOn.tools) || self.toolRefs.all(t, t in self.dependsOn.tools)"
+                  message: "every entry in spec.toolRefs must appear in spec.dependsOn.tools (cross-asset dep gate cannot resolve undeclared tool)"
+              properties:
+                # ── Identity ──
+                agentName:
+                  type: string
+                  description: |
+                    Agent identity. Must match the AgentCore Runtime
+                    agentRuntimeName pattern (alphanumerics, underscore, hyphen).
+                    AWS AgentCore accepts both underscores and hyphens; we follow
+                    the same constraint to avoid name-translation between
+                    AgentConfig.spec.agentName and AgentCore Runtime API.
+                  pattern: "^[a-zA-Z0-9]([-_a-zA-Z0-9]*[a-zA-Z0-9])?$"
+                  maxLength: 63
+                  minLength: 1
+                  example: my-agent
+                provider:
+                  type: string
+                  description: |
+                    Hosting provider for this agent. Dual-provider support:
+                      - awsAgentCore: AWS-managed AgentCore Runtime hosting (default).
+                      - kubernetesPod: in-cluster Deployment + Service hosting, owned by
+                        the asset's Component for cascade-delete via Canvas.
+                    Both providers honor the same dependsOn semantics, governance metadata,
+                    safety attestation (composition truthfulness invariant), and Registry
+                    projection. The operator dispatches on this field. As an open contract with
+                    an opinionated AWS reference implementation, the schema permits ANY lowercase
+                    alphanumeric provider id so sibling operators can register additional
+                    providers without a CRD bump.
+                  pattern: "^[a-z][a-zA-Z0-9-]*$"
+                  minLength: 1
+                  maxLength: 63
+                  default: awsAgentCore
+                  example: awsAgentCore
+                paused:
+                  type: boolean
+                  default: false
+                  description: "When true, the operator withdraws the agent's serving path / governance perimeter so it can no longer be invoked through the governed path (a soft kill-switch); the CR is retained for audit and can be un-paused."
+                # ── Declarative spec lineage (TMF/GB1085 conformance anchor) ──
+                specLineage:
+                  type: object
+                  description: "Declarative TMF specification lineage for this asset (conformance anchor; ref: GB1085 §4)."
+                  properties:
+                    sdo: { type: string, default: "TMForum", example: "TMForum" }
+                    specification: { type: string, example: "GB1085 Model-as-a-Service v1.0.0" }
+                    section: { type: string, example: "§1.3.1 Agent Developer enablement" }
+                    sidEntity: { type: string, example: "LogicalResource" }
+
+                # ── Cross-vendor neutrality fields ──
+                # These fields keep the contract provider-neutral: governance is
+                # declared once and applies regardless of which platform hosts the agent.
+                # ── Registry reference ──
+                # Points to a Registry CR that selects the backing catalog.
+                # Optional — defaults to the annotated default Registry in
+                # the modaas namespace. Follows K8s PVC.storageClassName /
+                # Ingress.ingressClassName convention.
+                registryRef:
+                  type: object
+                  description: "Reference to the Registry CR that this asset publishes to."
+                  properties:
+                    name:
+                      type: string
+                      maxLength: 253
+                    namespace:
+                      type: string
+                      default: "modaas-system"
+                      maxLength: 63
+                networkMode:
+                  type: string
+                  enum: [PUBLIC, VPC, PRIVATE]
+                  default: PUBLIC
+                  description: "Network posture for the agent runtime. PUBLIC=internet; VPC=in-VPC isolation; PRIVATE=private-only endpoints. Maps to AgentCore networkMode, Azure VNet, Vertex VPC-SC."
+                modelRef:
+                  type: string
+                  pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                  maxLength: 63
+                  description: "Primary model alias. Lifted from dependsOn.models for MCP/Azure parity (Azure declarative: model.id; MCP: model ref). Operator injects as MODEL_ALIAS env var."
+                toolRefs:
+                  type: array
+                  items:
+                    type: string
+                    pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                    maxLength: 63
+                  maxItems: 50
+                  description: "Tool aliases available to the agent. Mirrors Azure declarative tools[] and MCP client tool list. Operator projects as env-var TOOL_REFS or pre-registered tool access."
+
+                # ── Agent Card (A2A discovery) ──
+                agentCard:
+                  type: object
+                  description: "A2A-style agent card describing this agent to peers and consumers: its description, declared skills, supported interfaces, and protocol binding. Used for discovery and agent-to-agent interaction."
+                  required: ["description", "skills"]
+                  properties:
+                    description:
+                      type: string
+                      maxLength: 512
+                      minLength: 1
+                    skills:
+                      type: array
+                      minItems: 1
+                      items:
+                        type: string
+                    protocolBinding:
+                      type: string
+                      enum: ["HTTP+JSON", "HTTP+PROTO", "gRPC"]
+                      default: "HTTP+JSON"
+                    supportedInterfaces:
+                      type: array
+                      items:
+                        type: string
+                    # ── A2A parity additions ──
+                    capabilities:
+                      type: array
+                      maxItems: 20
+                      items:
+                        type: string
+                      description: "Declared agent capabilities for A2A discovery. Examples: 'text-generation', 'tool-calling', 'multimodal', 'streaming'."
+                    endpoints:
+                      type: array
+                      maxItems: 10
+                      items:
+                        type: object
+                        required: ["name", "url"]
+                        properties:
+                          name:
+                            type: string
+                            pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                            maxLength: 63
+                          url:
+                            type: string
+                            maxLength: 2048
+                          protocol:
+                            type: string
+                            enum: [HTTP, HTTPS, MCP, gRPC]
+                      description: "Agent endpoint publication for A2A handshake. Multiple endpoints supported (e.g. invoke, healthz, stream)."
+
+                # ── Dependencies ──
+                dependsOn:
+                  type: object
+                  description: "Cross-asset dependency declaration: the models and tools this agent invokes (parallel string arrays models[]/tools[]). Admission gates the agent on those dependencies being Approved; thereafter the dependency posture is surfaced as a status condition rather than force-torn-down."
+                  properties:
+                    models:
+                      type: array
+                      maxItems: 50
+                      items:
+                        type: string
+                        maxLength: 63
+                        pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                    tools:
+                      type: array
+                      maxItems: 50
+                      items:
+                        type: string
+                        maxLength: 63
+                        pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+
+                # ── Safety attestation (composition truthfulness invariant) ──
+                # The AgentConfig author attests to whether the agent runtime
+                # honors the safety contract of the dependency models/tools.
+                # Cross-CR composition predicates cannot be evaluated at
+                # admission CEL (which is restricted to fields of `self`).
+                # The agent operator evaluates the predicate at first
+                # reconcile: if a referenced ModelConfig declares
+                # safety.required=true and the AgentConfig does not attest a
+                # matching enforcerKind, the operator writes phase=Failed
+                # with reason=EnforcementNotDeclared / EnforcerKindMismatch
+                # and refuses to project the asset to the federated
+                # registry. The candidate is admitted to the cluster but
+                # never reaches phase=Approved and never serves traffic.
+                #
+                # Intra-CR self-contradiction IS refused at admission CEL on
+                # this same schema. The cross-CR composition predicate runs
+                # in the operator.
+                safety:
+                  type: object
+                  description: "Agent-side safety attestation. Required when any dependsOn.models has safety.required=true."
+                  properties:
+                    enforces:
+                      type: boolean
+                      default: false
+                      description: "AgentConfig author attests the runtime honors declared upstream safety contracts."
+                    enforcerKind:
+                      type: string
+                      enum: [bedrockGuardrail, bedrockGuardrailExternal, gatewayFilter, external, none]
+                      description: "Which enforcement kind the agent runtime honors. Must match upstream ModelConfig.spec.safety.enforcer.kind (enum kept in lockstep with ModelConfig for cross-CR composition)."
+                    # ── Enforcement driver axis ──
+                    enforcedAt:
+                      type: string
+                      pattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+                      default: self
+                      example: self
+                      description: "Enforcement driver — which gateway governs this agent's boundary. self=MoDaaS AI Gateway (default; the reference path that ships today); agentgateway/muleSoftAiGateway federate to an external driver (reserved for future sibling implementations). Orthogonal to provider."
+                    enforcedBy:
+                      type: string
+                      description: "Free-form description of HOW enforcement is implemented (audit trail). E.g., 'strands-BedrockModel-guardrail-env', 'ai-gateway-pod-injection', 'sidecar-enforcer'."
+                      maxLength: 256
+                  x-kubernetes-validations:
+                    # Composition truthfulness — enforces=true MUST declare a kind
+                    - rule: "!self.enforces || has(self.enforcerKind)"
+                      message: "safety.enforces=true requires safety.enforcerKind to be declared"
+                    # enforces=false MUST NOT declare enforcerKind != 'none'
+                    - rule: "self.enforces || !has(self.enforcerKind) || self.enforcerKind == 'none'"
+                      message: "safety.enforces=false requires enforcerKind to be absent or 'none'"
+                    # Composition truthfulness: enforces=true with kind='none' is contradictory.
+                    # Mirrors ModelConfig's intra-CR truthfulness invariant (safety.required=true must not pair with enforcer.kind='none').
+                    - rule: "!self.enforces || self.enforcerKind != 'none'"
+                      message: "safety.enforces=true cannot combine with enforcerKind='none' (contradictory: agent claims to enforce while declaring no enforcement)"
+
+                # ── Enforcement-driver credentials (neutral vocab, shared with ToolConfig) ──
+                credentialProviderType:
+                  type: string
+                  enum: [NONE, providerManaged, API_KEY, OAUTH]
+                  default: NONE
+                  description: "Neutral credential scope for the enforcement driver. Type only — actual secret in credentialSecretRef."
+                credentialSecretRef:
+                  type: string
+                  maxLength: 253
+                  description: "Name of Kubernetes Secret holding enforcement-driver credentials. Required when credentialProviderType is API_KEY or OAUTH. Credentials NEVER inline in CRD."
+
+                # ── Governance ──
+                governance:
+                  type: object
+                  description: "Governance metadata for this agent: ownership, data-classification, lifecycle/retirement, and the optional approval gate. Drives admission checks and the discovery-catalog record."
+                  properties:
+                    owner: { type: string }
+                    costCenter: { type: string }
+                    dataClassification:
+                      type: string
+                      enum: [public, internal, confidential, pii, regulated, restricted]
+                    retirementDate:
+                      type: string
+                      format: date
+                    # ── Governance Approval Gate ──
+                    approval:
+                      type: object
+                      description: |
+                        Human/policy approval gate. When required=true,
+                        the operator parks the CR in phase=Reviewing until
+                        a signed attestation from the role declared in
+                        approverRole appears in status.governance.approvals[].
+                        Default for required flips on spec.safety.enforces so
+                        agents that don't attest enforcement keep auto-approving.
+                      properties:
+                        required:
+                          type: boolean
+                          description: "When unset, defaults to spec.safety.enforces (the approval gate auto-enables for safety-attesting agents; governance approval gate)."
+                        requiredApprovals:
+                          type: integer
+                          minimum: 1
+                          default: 1
+                        approverRole:
+                          type: string
+                          description: "FQN role name. Defaults to modaas-agentconfig-<agentName>-admin (Canvas IdentityConfig + Keycloak provisioning)."
+                          maxLength: 253
+
+                # ── Access control ──
+                access:
+                  type: object
+                  description: "Authorization overlay for this agent: a restrict-only (forbid) Cedar overlay and the required consumer role. It can narrow what this agent may do below what the target tools permit, never widen it (separation of duties)."
+                  properties:
+                    requiredRole:
+                      type: string
+                    cedarPolicy:
+                      type: string
+
+                # ── Agent-Action Policy Contract ──
+                # Declarative agent-action policy intent. Distinct from
+                # spec.safety (token-level content safety) — this block
+                # governs principal-action-resource-context decisions
+                # on tool invocation. The contract is engine-agnostic:
+                # cedar | opa | avp | webhook | none. When required=true the
+                # operator validates the referenced policy text and projects
+                # it into a backing PDP (policy decision point) that the
+                # agent's PEP (policy enforcement point) consults at tool-call time.
+                agentPolicy:
+                  type: object
+                  description: |
+                    Agent-action policy. When required=true, the
+                    operator validates the policy text at reconcile and
+                    projects it into the chosen PDP (Cedar in-cluster, AVP,
+                    AgentCore Authorization, or webhook). The PEP (per-runtime)
+                    consults the PDP before each tool call (reserved for future
+                    sibling implementations; the in-cluster Cedar reference path
+                    is what ships today). Fail-closed by default; per-engine
+                    failMode override available.
+                  properties:
+                    required:
+                      type: boolean
+                      default: false
+                      description: "When true, agent-action policy is mandatory; admission/operator refuses if engine block is missing or invalid."
+                    engine:
+                      type: object
+                      properties:
+                        kind:
+                          type: string
+                          enum: [cedar, opa, avp, webhook, none]
+                          description: "Policy engine. cedar = AWS reference; opa/avp/webhook = pluggable; none = explicit no-policy (only valid when required=false)."
+                        cedar:
+                          type: object
+                          description: "Cedar engine config (AWS reference path). Used when engine.kind=cedar."
+                          properties:
+                            policyRef:
+                              type: object
+                              required: [configMap]
+                              properties:
+                                configMap:
+                                  type: string
+                                  maxLength: 253
+                                  description: "Name of the ConfigMap holding the Cedar policy text (in the same namespace as the AgentConfig)."
+                                key:
+                                  type: string
+                                  default: "policy.cedar"
+                                  maxLength: 253
+                                  description: "Key inside the ConfigMap whose value is the Cedar policy text."
+                            pdpRef:
+                              type: object
+                              properties:
+                                kind:
+                                  type: string
+                                  enum: [inCluster, avp, agentCoreAuth]
+                                  description: "Where the policy decision point runs. inCluster = MoDaaS reference PDP (agent-action policy contract); avp = AWS Verified Permissions; agentCoreAuth = AgentCore Authorization."
+                                policyStoreId:
+                                  type: string
+                                  description: "AVP policy store id (only when pdpRef.kind=avp)."
+                                  maxLength: 256
+                            principalAttributes:
+                              type: object
+                              description: "How to extract principal attributes for the decision request."
+                              x-kubernetes-preserve-unknown-fields: true
+                            resourceAttributes:
+                              type: object
+                              description: "How to extract resource attributes (e.g. from ToolConfig labels)."
+                              x-kubernetes-preserve-unknown-fields: true
+                            contextAttributes:
+                              type: object
+                              description: "How to extract decision context attributes."
+                              x-kubernetes-preserve-unknown-fields: true
+                          x-kubernetes-validations:
+                            - rule: "has(self.policyRef) && has(self.policyRef.configMap)"
+                              message: "agentPolicy.engine.cedar requires policyRef.configMap"
+                        opa:
+                          type: object
+                          description: "OPA engine config. Used when engine.kind=opa."
+                          properties:
+                            bundleUrl:
+                              type: string
+                              maxLength: 2048
+                              description: "URL of the OPA bundle (tar.gz) carrying the policy."
+                            decisionPath:
+                              type: string
+                              maxLength: 256
+                              description: "Decision path (e.g. agent/allow)."
+                          x-kubernetes-validations:
+                            - rule: "has(self.bundleUrl) && has(self.decisionPath)"
+                              message: "agentPolicy.engine.opa requires bundleUrl and decisionPath"
+                        webhook:
+                          type: object
+                          description: "Customer webhook PDP config. Used when engine.kind=webhook."
+                          properties:
+                            url:
+                              type: string
+                              maxLength: 2048
+                              description: "PDP decision endpoint URL."
+                            timeoutMs:
+                              type: integer
+                              minimum: 1
+                              maximum: 30000
+                              default: 50
+                              description: "Decision RPC timeout in milliseconds."
+                            failMode:
+                              type: string
+                              enum: [closed, open]
+                              default: closed
+                              description: "Behavior when PDP is unreachable. closed = deny; open = allow (NOT recommended for production)."
+                          x-kubernetes-validations:
+                            - rule: "has(self.url)"
+                              message: "agentPolicy.engine.webhook requires url"
+                      x-kubernetes-validations:
+                        - rule: "has(self.kind)"
+                          message: "agentPolicy.engine.kind is required when agentPolicy.engine is set"
+                        # When kind is set, the corresponding engine.<kind> block must be populated
+                        - rule: "self.kind != 'cedar' || has(self.cedar)"
+                          message: "agentPolicy.engine.kind=cedar requires agentPolicy.engine.cedar block"
+                        - rule: "self.kind != 'opa' || has(self.opa)"
+                          message: "agentPolicy.engine.kind=opa requires agentPolicy.engine.opa block"
+                        - rule: "self.kind != 'webhook' || has(self.webhook)"
+                          message: "agentPolicy.engine.kind=webhook requires agentPolicy.engine.webhook block"
+                  x-kubernetes-validations:
+                    # required=true demands an engine block AND a non-'none' engine kind
+                    - rule: "!self.required || has(self.engine)"
+                      message: "agentPolicy.required=true requires agentPolicy.engine to be declared"
+                    - rule: "!self.required || !has(self.engine) || self.engine.kind != 'none'"
+                      message: "agentPolicy.required=true is incompatible with engine.kind=none (use required=false instead)"
+
+                # ── AWS AgentCore runtime (one of two hosting providers) ──
+                #
+                # Two modes:
+                #  1. IMPORT: set only agentRuntimeId to adopt a pre-existing runtime.
+                #     Operator will not create/update/delete it.
+                #  2. MANAGED: set containerUri + roleArn (+ optional region, gateway URL).
+                #     Operator creates the runtime on first reconcile, updates on image change,
+                #     deletes on CR deletion.
+                awsAgentCore:
+                  type: object
+                  description: "Provider-specific configuration when provider=awsAgentCore (the managed runtime that hosts this agent). One of the two reference hosting providers (with kubernetesPod) the AWS implementation realizes; matched to spec.provider (CEL-enforced)."
+                  properties:
+                    agentRuntimeId:
+                      type: string
+                      description: "Existing AgentCore Runtime id to import (leave containerUri unset)."
+                      minLength: 1
+                    containerUri:
+                      type: string
+                      description: "ECR image URI for managed mode. Implies operator owns the runtime."
+                      minLength: 1
+                    roleArn:
+                      type: string
+                      description: "IAM role ARN the runtime executes as (managed mode)."
+                      # Constrained to a regex matching real IAM role ARNs
+                      # (matches the SageMaker pattern used elsewhere in this CRD).
+                      pattern: "^arn:aws:iam::[0-9]{12}:role/.+$"
+                    region:
+                      type: string
+                      description: "AWS region for the runtime (default: us-west-2)."
+                      minLength: 1
+                    agentCoreGatewayMcpUrl:
+                      type: string
+                      description: "Optional: AgentCore Gateway MCP endpoint for tool calls; injected as env var."
+                      minLength: 1
+                    skipEnvInjection:
+                      type: boolean
+                      default: false
+                      description: |
+                        SDK-redirect opt-out. When true, the operator does NOT
+                        inject standard SDK env vars (AWS_ENDPOINT_URL_BEDROCK_RUNTIME,
+                        AWS_ENDPOINT_URL_SAGEMAKER_RUNTIME, OPENAI_BASE_URL, etc.)
+                        into the AgentCore Runtime. Use this for:
+                          - Rollback when a newly redirected agent misbehaves.
+                          - Agents that intentionally call AWS directly (rare; usually
+                            indicates the agent should not be a MoDaaS-governed asset
+                            in the first place).
+                        Default false: env injection is on. Flip via
+                        `kubectl patch agentconfig <name> --type=merge -p
+                        'spec: {awsAgentCore: {skipEnvInjection: true}}'`. The operator
+                        re-reconciles next tick and strips the SDK-redirect env vars
+                        (legacy MODEL_ALIAS / TOOL_ALIAS preserved).
+                    # ─── authorizerConfiguration (governance pass-through) ───
+                    # Lets the AgentCore Runtime accept the same JWT tokens as
+                    # the AI Gateway (consistent Keycloak reachability).
+                    authorizerConfiguration:
+                      type: object
+                      description: "Optional: AgentCore Runtime authorizer (e.g. customJWTAuthorizer pointing at Keycloak)."
+                      x-kubernetes-preserve-unknown-fields: true
+                      properties:
+                        customJWTAuthorizer:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                          properties:
+                            discoveryUrl:
+                              type: string
+                              description: "OIDC discovery URL of the JWT issuer (e.g. Keycloak realm)."
+                            allowedAudience:
+                              type: array
+                              items: { type: string }
+                            allowedClients:
+                              type: array
+                              items: { type: string }
+                            allowedScopes:
+                              type: array
+                              items: { type: string }
+                    # ─── protocolConfiguration (governance pass-through) ───
+                    # Declares which protocol the agent container serves. AgentCore
+                    # Runtime uses this to route incoming requests correctly.
+                    protocolConfiguration:
+                      type: object
+                      description: "Optional: protocol the agent serves (MCP/HTTP/A2A)."
+                      properties:
+                        serverProtocol:
+                          type: string
+                          enum: [MCP, HTTP, A2A]
+                          description: "Protocol the agent container speaks."
+                    # ─── lifecycleConfiguration (governance pass-through) ───
+                    # Governance-relevant: idle session timeout + max lifetime. Enables
+                    # bounded-lifetime for sensitive workloads and cost controls on
+                    # long-lived agents.
+                    lifecycleConfiguration:
+                      type: object
+                      description: "Optional: AgentCore Runtime session lifecycle tuning."
+                      properties:
+                        idleRuntimeSessionTimeout:
+                          type: integer
+                          minimum: 0
+                          description: "Seconds. 0 = no idle timeout."
+                        maxLifetime:
+                          type: integer
+                          minimum: 0
+                          description: "Seconds. 0 = no max lifetime cap."
+                    # ─── networkModeConfig pass-through (governance-relevant) ───
+                    # Required when spec.networkMode is VPC or PRIVATE. Declares the
+                    # subnets + security groups the runtime attaches to. Governance-
+                    # relevant: dataClassification=restricted + networkMode=PUBLIC is
+                    # a contradiction; restricted workloads should run in VPC/PRIVATE
+                    # mode with declared network posture.
+                    networkModeConfig:
+                      type: object
+                      description: "Required when spec.networkMode is VPC or PRIVATE."
+                      properties:
+                        subnets:
+                          type: array
+                          minItems: 1
+                          items:
+                            type: string
+                            pattern: "^subnet-[0-9a-f]{8,17}$"
+                          description: "VPC subnet IDs the runtime attaches to."
+                        securityGroups:
+                          type: array
+                          minItems: 1
+                          items:
+                            type: string
+                            pattern: "^sg-[0-9a-f]{8,17}$"
+                          description: "Security group IDs applied to the runtime ENIs."
+                  x-kubernetes-validations:
+                    - rule: "has(self.agentRuntimeId) || (has(self.containerUri) && has(self.roleArn))"
+                      message: "awsAgentCore requires either agentRuntimeId (import) or containerUri+roleArn (managed)"
+
+                # ── Kubernetes Pod hosting ──
+                # Required when spec.provider=kubernetesPod. The operator creates a
+                # Deployment + Service in the components namespace, owned by
+                # the asset's Component CR for cascade-delete.
+                kubernetesPod:
+                  type: object
+                  description: |
+                    Kubernetes Pod hosting backend. The operator
+                    reconciles a Deployment + ClusterIP Service named agent-<name> in
+                    the components namespace. The Component CR owns both objects
+                    (cascade-delete on Component removal). SDK redirect env
+                    vars are injected into the Deployment env block automatically.
+                  required: ["containerImage"]
+                  properties:
+                    containerImage:
+                      type: string
+                      description: "Container image URI the agent runs (e.g., my-org/my-agent:1.2.0 or ECR URI)."
+                      minLength: 1
+                      maxLength: 1024
+                    port:
+                      type: integer
+                      description: "TCP port the agent's HTTP server listens on."
+                      minimum: 1
+                      maximum: 65535
+                      default: 8080
+                    replicas:
+                      type: integer
+                      description: "Deployment replica count."
+                      minimum: 0
+                      maximum: 50
+                      default: 1
+                    serviceAccountName:
+                      type: string
+                      description: |
+                        ServiceAccount the agent pod runs under. Defaults to
+                        modaas-agent-default (provisioned by the modaas Helm chart).
+                        Override when the agent needs IRSA or extra K8s permissions.
+                      maxLength: 253
+                    env:
+                      type: array
+                      description: |
+                        User-supplied env vars merged ON TOP OF the SDK redirect
+                        vars and legacy back-compat vars (REGION, REGISTRY_ID,
+                        MODEL_ALIAS, TOOL_ALIAS). User keys win on conflict.
+                      maxItems: 50
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name:
+                            type: string
+                            maxLength: 253
+                          value:
+                            type: string
+                            maxLength: 4096
+                          valueFrom:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                            description: "Standard K8s EnvVarSource (configMapKeyRef, secretKeyRef, fieldRef, resourceFieldRef)."
+                    resources:
+                      type: object
+                      description: "Container resource requests + limits. Defaults applied when unset."
+                      properties:
+                        requests:
+                          type: object
+                          properties:
+                            cpu:    { type: string, default: "100m" }
+                            memory: { type: string, default: "128Mi" }
+                        limits:
+                          type: object
+                          properties:
+                            cpu:    { type: string, default: "500m" }
+                            memory: { type: string, default: "512Mi" }
+                    imagePullSecrets:
+                      type: array
+                      description: "Image pull secrets to attach to the agent pod."
+                      maxItems: 8
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name:
+                            type: string
+                            maxLength: 253
+
+            # ═════════════════════════════════════════════════════════════════
+            # STATUS
+            # ═════════════════════════════════════════════════════════════════
+            status:
+              type: object
+              x-kubernetes-validations:
+                # A globalResourceEndpoint immutability rule was removed while the
+                # field is still being shaped (path scheme, scope semantics) and
+                # operator drift corrections land. Re-add once a stable contract
+                # is published.
+                # REFUSE a status patch transitioning to phase=Approved without
+                # globalResourceEndpoint set in the same patch. CEL has no warn
+                # modality, so this rule hard-rejects. The operator MUST write
+                # phase + globalResourceEndpoint in the same patch.status call.
+                - rule: |
+                    !has(self.phase) || self.phase != 'Approved' || has(self.globalResourceEndpoint)
+                  message: "status.globalResourceEndpoint MUST be set when phase=Approved (operator must write both in the same status patch)"
+                # ── Admission CEL invariants (claim verification) ──
+                # Deferred: globalResourceEndpoint scope vs consumers.
+                #   Activate once status.boundPublicConsumers (list) is added.
+                #   Intent: refuse Approved + endpointScope=mesh when public-vantage
+                #   consumers are bound. K8s CEL rejects unknown structural-schema
+                #   field paths even when has()-guarded, so this rule lands with the field.
+                # Deferred: effectiveNetworkMode=PUBLIC + Approved must carry
+                #   status.endpoints.public. Activate once status.endpoints schema lands
+                #   (currently only spec.agentCard.endpoints exists).
+                # Deferred: IdentityProvisioned=True ↔ non-empty
+                #   status.identityConfigRef. Activate once identityConfigRef is
+                #   promoted into the status schema. Until then operator-owned.
+                # Enforced (cascade-observability + composition-truthfulness reaffirmation):
+                #   when conditions includes DependencyHealthy=False, phase MUST NOT be
+                #   Approved. Catches the silent-fail mode where dependency cascade was
+                #   bypassed but the AgentConfig still claims Approved.
+                - rule: |
+                    !has(self.conditions)
+                    || !(has(self.phase) && self.phase == 'Approved')
+                    || self.conditions.all(c,
+                         c.type != 'DependencyHealthy' || c.status != 'False')
+                  message: "phase=Approved is incompatible with DependencyHealthy=False; a cross-asset dependency cascade was violated (cascade observability + composition truthfulness)."
+              properties:
+                # ── kopf handler results ─────────────────────────────────────────────
+                # kopf persists each handler's RETURN VALUE at status.<handler_id>. These were not
+                # declared, and status has no x-kubernetes-preserve-unknown-fields, so the API stripped
+                # them and every reconcile logged:
+                #   Patching failed with inconsistencies: (('remove', ('status','reconcile'), ...))
+                # That warning is identical whether the dropped field is kopf bookkeeping or a field the
+                # operator genuinely meant to publish, so a constant benign version of it cannot warn about
+                # the dangerous one. Declared explicitly rather than via preserve-unknown-fields so a
+                # genuinely mistyped status key still gets rejected.
+                reconcile:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for reconcile() — diagnostic, not API surface.
+                resync_from_registry:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for resync_from_registry() — diagnostic, not API surface.
+                scan_orphan_records:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for scan_orphan_records() — diagnostic, not API surface.
+                cleanup:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for cleanup() — diagnostic, not API surface.
+                check_dependency_health:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for check_dependency_health() — diagnostic, not API surface.
+                phase:
+                  type: string
+                  # Reviewing sits between Pending and Approved (governance approval gate).
+                  enum: [Pending, Reviewing, Approved, Active, Failed, Paused, Retired]
+                reason: { type: string, maxLength: 512 }
+                observedGeneration: { type: integer }
+                lastReconciled: { type: string, format: date-time }
+                agentCardUrl: { type: string }
+                virtualServiceName: { type: string }
+                keycloakRoleId: { type: string }
+                agentRuntimeId:
+                  type: string
+                  description: "AgentCore Runtime id (present when provider=awsAgentCore)"
+                agentRuntimeArn:
+                  type: string
+                  description: "AgentCore Runtime ARN (present when provider=awsAgentCore)"
+                hostingProvider:
+                  type: string
+                  enum: [awsAgentCore, kubernetesPod]
+                  description: "Effective hosting provider selected by the operator (dual-provider hosting)"
+                # ── Status block for Kubernetes Pod hosting ──
+                kubernetesPod:
+                  type: object
+                  description: "Backing Deployment + Service names when provider=kubernetesPod (dual-provider hosting)."
+                  properties:
+                    deploymentName:
+                      type: string
+                      description: "Name of the operator-managed Deployment in the components namespace."
+                      maxLength: 253
+                    serviceName:
+                      type: string
+                      description: "Name of the operator-managed ClusterIP Service in the components namespace."
+                      maxLength: 253
+                    ready:
+                      type: boolean
+                      description: "True when Deployment.status.readyReplicas == spec.kubernetesPod.replicas."
+                managed:
+                  type: boolean
+                  description: "True if operator created the runtime (managed mode); false if imported"
+                # IAM-inspection findings recorded when adopting an existing runtime
+                # (warning-level; never blocks approval). Declared so the operator's
+                # write is not silently stripped — these are a security signal.
+                riskFindings:
+                  type: array
+                  description: "Advisory IAM-posture findings from inspecting an adopted runtime's role (severity/code/message). Warning-level; does not block approval."
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                # ── Observability fields ──
+                agentRuntimeVersion:
+                  type: string
+                  description: "AgentCore Runtime version identifier (observability, not CRD input)"
+                workloadIdentityArn:
+                  type: string
+                  description: "AWS workload identity ARN attached to the runtime (audit trail)"
+                effectiveNetworkMode:
+                  type: string
+                  enum: [PUBLIC, VPC, PRIVATE]
+                  description: "Network mode actually applied by the operator (may differ from spec if operator downgraded for safety)"
+                registryRecordId:
+                  type: string
+                  description: "Governance-registry record key. Convention: <provider>_<asset_id>, both halves normalized (lowercase, '_'->'-', leading-alpha). Unified pattern across ModelConfig/ToolConfig/AgentConfig."
+                  pattern: "^[a-z][a-z0-9-]*_[a-z][a-z0-9-]*$"
+                registryApprovalStatus:
+                  type: string
+                  description: "Observed registry state from timer-driven resync."
+                  enum: [APPROVED, DRAFT, PENDING, DEPRECATED, MISSING, UNKNOWN]
+                # ── Registry backing reference (status mirror) ──
+                registryBackingRef:
+                  type: object
+                  description: "Observed backing that received this asset's record at last reconcile."
+                  properties:
+                    name:
+                      type: string
+                      description: "Registry CR name that was resolved."
+                    backing:
+                      type: string
+                      description: "Backing kind (agentcore | tmf639 |...)."
+                    recordId:
+                      type: string
+                      description: "Backing-specific record id (e.g., AgentCore recordId)."
+                    observedAt:
+                      type: string
+                      format: date-time
+                registryLastObserved:
+                  type: string
+                  format: date-time
+                  description: "Wall-clock time of last resync from registry (@timer every 5 min)."
+                driftDetected:
+                  type: boolean
+                  description: "True when CR state contradicts registry state."
+                driftReason:
+                  type: string
+                  maxLength: 256
+                  description: "Human-readable explanation when driftDetected=true."
+                tmf639ResourceId:
+                  type: string
+                  description: "TMF639 Resource ID from Canvas Resource Inventory v5 (Canvas-native projection)."
+                daysUntilRetirement: { type: integer }
+                # ── Governance perimeter URL ──
+                # The operator writes status.endpoint; this property MUST be
+                # declared in the schema, otherwise K8s silently strips the
+                # write and the field stays empty.
+                endpoint:
+                  type: string
+                  description: "Governed runtime URL agents MUST call. Per-wire-format path (e.g. .../mcp/<alias> for gateway-fronted agents, or the AgentCore Runtime ARN for direct-runtime agents). Status-driven discovery clients read THIS, not upstreamEndpoint, to stay on the governed path."
+                # Per-scope governed endpoint map {scope: url} the operator publishes
+                # via the shared perimeter-URL helper. Open object (dynamic scope keys)
+                # — declared so K8s does not silently strip the operator's write.
+                endpoints:
+                  type: object
+                  description: "Per-scope governed endpoint URLs the operator resolved for this asset. The single best one is mirrored to status.endpoint."
+                  x-kubernetes-preserve-unknown-fields: true
+                upstreamEndpoint:
+                  type: string
+                  description: "Raw provider URL behind the gateway (AgentCore Runtime ARN / Gateway MCP URL). Diagnostics only — agents that call this directly bypass MoDaaS governance and provider-agnostic guardrail enforcement."
+                # ── Global Resource Endpoint + scope ──
+                globalResourceEndpoint:
+                  type: string
+                  format: uri
+                  description: |
+                    Stable, externally-resolvable URL representing the governance perimeter
+                    for this asset. Set by the operator on transition to Approved. Immutable
+                    thereafter. Format: https://<gateway-host>/<wire-format>/<asset-uid>.
+                endpointScope:
+                  type: string
+                  enum: [mesh, vpc, public]
+                  description: |
+                    Resolvable scope of globalResourceEndpoint. mesh = cluster-internal only;
+                    vpc = VPC-internal; public = externally addressable.
+                componentRef:
+                  type: object
+                  description: "Canvas Component CR that owns this asset (set by operator after Component emission)."
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    uid:
+                      type: string
+                tmf639Resource:
+                  type: object
+                  description: "TMF639 v5 Resource Inventory record this asset projects to."
+                  properties:
+                    id:
+                      type: string
+                      description: "Stable TMF639 resource ID."
+                    url:
+                      type: string
+                      format: uri
+                      description: "Direct URL to the TMF639 record (e.g., RI baseUrl + /resource/{id})."
+                audit:
+                  type: object
+                  description: "Addressable audit pointers for this asset."
+                  properties:
+                    logGroup:
+                      type: string
+                      description: "CloudWatch log group name."
+                    queryUrl:
+                      type: string
+                      format: uri
+                      description: "Pre-built CloudWatch Logs Insights query URL."
+                # ── Governance approval audit trail ──
+                governance:
+                  type: object
+                  description: "Governance approval state, Reviewing → Approved gate."
+                  properties:
+                    approvals:
+                      type: array
+                      description: "Append-only list of signed approval attestations."
+                      items:
+                        type: object
+                        required: [subject, role, at]
+                        properties:
+                          subject: { type: string, maxLength: 253 }
+                          role: { type: string, maxLength: 253 }
+                          attestation: { type: string, maxLength: 2048 }
+                          signature: { type: string, maxLength: 4096 }
+                          at: { type: string, format: date-time }
+                    awaitingSince:
+                      type: string
+                      format: date-time
+                      nullable: true
+                    rejectedAt:
+                      type: string
+                      format: date-time
+                      nullable: true
+                    rejectedReason:
+                      type: string
+                      maxLength: 256
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: { type: string }
+                      status: { type: string, enum: ["True", "False", "Unknown"] }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string, format: date-time }
+                dependencyStatus:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                # ── `dependencyHealthy` is written by the operator (cascade
+                # observability) and MUST be declared in the schema, otherwise
+                # K8s silently strips the boolean.
+                dependencyHealthy:
+                  type: boolean
+                  description: "Cascade observability — top-level convenience scalar mirroring the DependencyHealthy condition. True iff every dependency is Approved+Active."
+                # ── Agent-Action Policy status mirror ──
+                # The operator publishes the engine selected, the PDP location,
+                # readiness of the PDP, and lightweight decision counters for
+                # observability. The schema declares the block so K8s does not
+                # silently strip operator writes.
+                agentPolicy:
+                  type: object
+                  description: "Agent-action policy status mirror. Populated by the agent operator when spec.agentPolicy is declared (agent-action policy contract)."
+                  properties:
+                    engineKind:
+                      type: string
+                      enum: [cedar, opa, avp, webhook, none]
+                      description: "Engine the operator resolved from spec.agentPolicy.engine.kind."
+                    pdpKind:
+                      type: string
+                      enum: [inCluster, avp, agentCoreAuth, opa, webhook, none]
+                      description: "Effective PDP backend (Cedar inCluster/avp/agentCoreAuth, or the engine kind itself for non-Cedar)."
+                    pdpReady:
+                      type: boolean
+                      description: "True when the PDP backend has loaded the projected policy and is reachable."
+                    projectedConfigMap:
+                      type: string
+                      maxLength: 253
+                      description: "Name of the projected ConfigMap in modaas-system that the PDP consumes (Cedar inCluster path)."
+                    lastValidatedAt:
+                      type: string
+                      format: date-time
+                      description: "Timestamp of the last successful policy syntax validation."
+                    lastDecision:
+                      type: object
+                      description: "Lightweight policy-decision counters (populated once agent-action-policy wiring is in place)."
+                      properties:
+                        allowed:
+                          type: integer
+                          minimum: 0
+                        denied:
+                          type: integer
+                          minimum: 0
+                        lastEvaluatedAt:
+                          type: string
+                          format: date-time
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - { name: Agent,    type: string,  jsonPath: .spec.agentName }
+        - { name: Provider, type: string,  jsonPath: .spec.provider }
+        - { name: Phase,    type: string,  jsonPath: .status.phase }
+        - { name: Paused,   type: boolean, jsonPath: .spec.paused, priority: 1 }
+        - { name: Reg,      type: string,  jsonPath: .status.registryApprovalStatus, priority: 1 }
+        - { name: Drift,    type: boolean, jsonPath: .status.driftDetected, priority: 1 }
+        - { name: Registry, type: string, jsonPath: .spec.registryRef.name, priority: 1 }
+        - { name: Global-Endpoint, type: string, jsonPath: .status.globalResourceEndpoint, priority: 1 }
+        - { name: Scope, type: string, jsonPath: .status.endpointScope, priority: 1 }
+
+        - { name: Age,      type: date,    jsonPath: .metadata.creationTimestamp }

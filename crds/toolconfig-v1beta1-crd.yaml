@@ -1,0 +1,852 @@
+# ToolConfig — Open-contract CRD for ODA Canvas tool lifecycle
+# =============================================================================
+# Namespace-scoped CRD declaring one MCP tool server's identity, endpoint,
+# tool schemas, access controls, and provider-specific configuration.
+#
+# Provider-agnostic at the root; provider-specific only within typed sub-blocks.
+# CEL rules enforce exactly-one typed block matching spec.provider, plus
+# immutability of the identity pair {toolName, provider}.
+#
+# Extension protocol: add one typed sub-block + one CEL rule pair.
+# =============================================================================
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: toolconfigs.oda.tmforum.org
+  labels:
+    app.kubernetes.io/part-of: modaas-canvas
+  annotations:
+    oda.tmforum.org/crd-version: "v1beta1"
+    # Declarative spec lineage — ties this CRD to the TMF specification it
+    # realizes, the way ODA Canvas CRDs cite TMF6xx / SID. MoDaaS is the first
+    # concrete implementation of GB1085 §4 Canvas Operator Requirements.
+    oda.tmforum.org/spec-sdo: "TMForum"
+    oda.tmforum.org/specification: "GB1085 Model-as-a-Service v1.0.0"
+    oda.tmforum.org/spec-section: "§4 Canvas Operator Requirements (tool registration + Canvas MCP)"
+    oda.tmforum.org/governed-asset: "tool"
+spec:
+  group: oda.tmforum.org
+  scope: Namespaced
+  names:
+    plural: toolconfigs
+    singular: toolconfig
+    kind: ToolConfig
+    shortNames: [tc]
+    categories: [oda, modaas]
+  conversion:
+    strategy: None
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: "Registers one backend (an AWS Lambda, HTTP API, or MCP server) as a governed tool that AI agents may call, and manages its lifecycle (onboarding, access policy, retirement). MCP = Model Context Protocol, the open JSON-RPC standard agents use to discover and invoke tools. An operator reconciles this spec against a backing gateway (AWS Bedrock AgentCore Gateway by default — an AWS managed service that fronts tool backends for agents) and publishes a discovery record. Open contract: provider is an open pattern, not a fixed enum — sibling operators add Databricks/MuleSoft/etc. without a CRD change. Runs on ODA Canvas (TM Forum's open telco-platform framework); realizes GB1085 §4 Canvas Operator Requirements (tool registration + Canvas MCP)."
+          required: ["spec"]
+          x-kubernetes-validations:
+            # Governance approval gate invariants
+            - rule: |
+                !has(self.status) || !has(self.status.phase) || self.status.phase != 'Approved'
+                || !has(self.spec.governance) || !has(self.spec.governance.approval)
+                || !has(self.spec.governance.approval.required)
+                || self.spec.governance.approval.required != true
+                || (has(self.status.governance) && has(self.status.governance.approvals)
+                    && size(self.status.governance.approvals) >=
+                       (has(self.spec.governance.approval.requiredApprovals) ? self.spec.governance.approval.requiredApprovals : 1))
+              message: "phase=Approved with governance.approval.required=true requires at least requiredApprovals signed attestations in status.governance.approvals[] (governance approval gate)."
+            # Grandfather transition rule — demands approval only when the safety
+            # posture is newly set (create) or changed (update). Pre-existing CRs
+            # with unchanged safety are grandfathered, so admission never rejects
+            # an already-Approved asset on re-apply (admission fires before the
+            # operator's approval check can run).
+            - rule: |
+                !(has(self.spec.safety) && has(self.spec.safety.required) && self.spec.safety.required == true)
+                || (oldSelf.hasValue() && has(oldSelf.value().spec.safety) && oldSelf.value().spec.safety == self.spec.safety)
+                || (has(self.spec.governance) && has(self.spec.governance.approval)
+                    && has(self.spec.governance.approval.required)
+                    && self.spec.governance.approval.required == true)
+              optionalOldSelf: true
+              message: "spec.safety.required=true demands spec.governance.approval.required=true — no silent auto-approve; pre-existing assets with unchanged safety are grandfathered (governance approval gate)."
+            - rule: |
+                !has(self.status) || !has(self.status.governance)
+                || !has(self.status.governance.approvals)
+                || !has(self.spec.governance) || !has(self.spec.governance.approval)
+                || !has(self.spec.governance.approval.approverRole)
+                || self.status.governance.approvals.all(a, !has(a.role) || a.role == self.spec.governance.approval.approverRole)
+              message: "every status.governance.approvals[].role must match spec.governance.approval.approverRole (governance approval gate)."
+          properties:
+            spec:
+              type: object
+              description: "Desired state of the governed tool: identity (toolName/provider), tool contract type, backing, access/PDP policy, and provider-specific config."
+              required: ["toolName", "provider"]
+              x-kubernetes-validations:
+                # ── Requirement rules: declared provider MUST have its block ──
+                - rule: "self.provider != 'agentCoreGateway' || has(self.agentCoreGateway)"
+                  message: "provider=agentCoreGateway requires spec.agentCoreGateway block"
+                - rule: "self.provider != 'custom' || has(self.custom)"
+                  message: "provider=custom requires spec.custom block"
+                # ── Exclusivity rules: no other provider's block may be present ──
+                - rule: "self.provider == 'agentCoreGateway' || !has(self.agentCoreGateway)"
+                  message: "spec.agentCoreGateway only allowed when provider=agentCoreGateway"
+                - rule: "self.provider == 'custom' || !has(self.custom)"
+                  message: "spec.custom only allowed when provider=custom"
+                # ── Immutability ──
+                - rule: "oldSelf.provider == self.provider"
+                  message: "spec.provider is immutable after creation"
+                - rule: "oldSelf.toolName == self.toolName"
+                  message: "spec.toolName is immutable after creation"
+                # registryRef selects the discovery-catalog backing (Registry CR).
+                # Immutable after creation: silently re-homing an asset's records
+                # to a different catalog would orphan the prior registry's records
+                # and break audit provenance. Optional field, guard both has() sides.
+                - rule: "!has(oldSelf.registryRef) || !has(self.registryRef) || oldSelf.registryRef == self.registryRef"
+                  message: "spec.registryRef is immutable after creation"
+                # ── Cross-vendor neutrality rules (v1beta1 additive) ──
+                - rule: "!has(self.credentialProviderType) || self.credentialProviderType == 'NONE' || self.credentialProviderType == 'providerManaged' || self.credentialProviderType == 'GATEWAY_IAM_ROLE' || has(self.credentialSecretRef)"
+                  message: "credentialProviderType=API_KEY|OAUTH requires credentialSecretRef pointing to a Kubernetes Secret (NONE/providerManaged/GATEWAY_IAM_ROLE are broker-injected, no secretRef needed)"
+                - rule: "!has(self.toolType) || self.toolType != 'openapi' || has(self.backendRef)"
+                  message: "toolType=openapi requires backendRef (typically an s3:// URI to OpenAPI spec)"
+                - rule: "!has(self.toolType) || self.toolType != 'smithy' || has(self.backendRef)"
+                  message: "toolType=smithy requires backendRef (typically an s3:// URI to Smithy IDL)"
+                - rule: "!has(self.toolType) || self.toolType != 'function' || has(self.backendRef) || has(self.agentCoreGateway) || has(self.custom)"
+                  message: "toolType=function requires a backing — backendRef (e.g. a Lambda ARN) or a provider block (agentCoreGateway/custom) that resolves the function target"
+              properties:
+                # ── Identity ──
+                toolName:
+                  type: string
+                  description: "Stable, human-friendly tool name that agents reference when invoking this tool. Immutable after creation; together with provider forms the identity pair."
+                  pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                  maxLength: 63
+                  minLength: 1
+                  example: aws-docs-helper
+                provider:
+                  type: string
+                  # OPEN CONTRACT (parity with AgentConfig): provider is an open
+                  # pattern, NOT a closed enum. The AWS reference operator handles
+                  # `agentCoreGateway`; sibling operators register additional providers
+                  # (databricks, muleSoftFlexGateway, Kong/Apigee, …) with NO CRD bump.
+                  # The requirement/exclusivity CEL rules short-circuit on
+                  # `provider != <block>`, so an unenumerated provider carrying no
+                  # typed block validates and is simply ignored by operators that don't
+                  # own it. `custom` remains the inline escape hatch.
+                  pattern: "^[a-z][a-zA-Z0-9-]*$"
+                  default: agentCoreGateway
+                  description: "Backing provider for this tool. Open contract: agentCoreGateway (AWS reference) + custom (inline escape) ship today; sibling operators add providers (e.g. databricks, muleSoftFlexGateway) without a CRD change. example: agentCoreGateway"
+                  example: agentCoreGateway
+                # ── Declarative spec lineage (TMF/GB1085 conformance anchor) ──
+                specLineage:
+                  type: object
+                  description: "Declarative TMF specification lineage for this asset (conformance anchor; ref: GB1085 §4)."
+                  properties:
+                    sdo: { type: string, default: "TMForum", example: "TMForum" }
+                    specification: { type: string, example: "GB1085 Model-as-a-Service v1.0.0" }
+                    section: { type: string, example: "§4 Canvas Operator Requirements" }
+                    sidEntity: { type: string, example: "LogicalResource" }
+                description:
+                  type: string
+                  description: "Free-text, human-readable description of this tool and its intended use; surfaced in discovery catalogs and the registry record."
+                  maxLength: 512
+                paused:
+                  type: boolean
+                  default: false
+                  description: "When true, the operator withdraws the tool's serving path so consumers can no longer invoke it (a soft kill-switch); the CR is retained for audit and can be un-paused."
+
+                # ── Safety attestation (approval default-flip; AgentConfig alignment) ──
+                # A tool attests whether it handles safety-sensitive data/actions.
+                # safety.required=true flips governance.approval.required on by
+                # default (the operator reads spec.safety.required for every kind).
+                # Tools do NOT enforce model guardrails — that is
+                # AgentConfig.safety.enforces. This block is the tool-side
+                # attestation, kept shape-consistent with ModelConfig.safety.required
+                # for cross-CRD uniformity.
+                safety:
+                  type: object
+                  description: "Tool safety attestation. Drives the approval default-flip."
+                  properties:
+                    required:
+                      type: boolean
+                      default: false
+                      description: "When true, this tool handles safety-sensitive data or performs sensitive actions; opts the tool into the governance approval gate by default."
+                    # ── Enforcement driver axis ──
+                    # ToolConfig already carries credential fields
+                    # (credentialProviderType/credentialSecretRef). enforcedAt names
+                    # which driver governs MCP/tool calls. agentgateway +
+                    # muleSoftAiGateway have the richest MCP policy suites, so the tool
+                    # path is their strongest fit.
+                    enforcedAt:
+                      type: string
+                      pattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+                      default: self
+                      example: self
+                      description: "Enforcement driver for tool/MCP calls. self=the platform's own gateway enforces inline (default); agentgateway/muleSoftAiGateway federate enforcement to an external driver (reserved for future sibling implementations; the self/reference path is what ships today)."
+
+                # ── Cross-vendor neutrality fields (v1beta1 additive) ──
+                # These fields keep the contract provider-neutral: governance is
+                # declared once and applies regardless of which backend serves the tool.
+                # ── Registry reference ──
+                # Points to a Registry CR that selects the backing catalog.
+                # Optional — defaults to the annotated default Registry in
+                # modaas-system. Follows K8s PVC.storageClassName /
+                # Ingress.ingressClassName convention.
+                registryRef:
+                  type: object
+                  description: "Reference to the Registry CR that this asset publishes to."
+                  properties:
+                    name:
+                      type: string
+                      maxLength: 253
+                    namespace:
+                      type: string
+                      default: "modaas-system"
+                      maxLength: 63
+                toolType:
+                  type: string
+                  enum: [mcp, openapi, smithy, function]
+                  default: mcp
+                  description: "Type of tool contract (MCP-aligned). Operator uses this with backendRef to project provider-specific config."
+                backendRef:
+                  type: string
+                  minLength: 1
+                  maxLength: 2048
+                  description: "Opaque backend reference interpreted by provider. Examples: Lambda ARN, HTTPS URL, s3://bucket/key URI."
+                outputSchema:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: "JSON Schema for tool result (MCP outputSchema equivalent). Enables response validation and tool-selection reasoning."
+                annotations:
+                  type: object
+                  description: "Behavior annotations (MCP-aligned). Governance can route policy based on these."
+                  properties:
+                    readOnly:
+                      type: boolean
+                      default: true
+                      description: "Tool does not modify state (safe by default)"
+                    idempotent:
+                      type: boolean
+                      default: true
+                      description: "Repeated calls with same input produce same result"
+                    destructive:
+                      type: boolean
+                      default: false
+                      description: "Tool performs irreversible operations (deletes, sends email, etc.)"
+                credentialProviderType:
+                  type: string
+                  # The NEUTRAL credential vocabulary is provider-agnostic.
+                  # `providerManaged` is the abstract "the
+                  # broker injects an identity it manages" mode — each provider
+                  # block realizes it (agentCoreGateway → GATEWAY_IAM_ROLE,
+                  # a MuleSoft/Kong block → its own managed identity). The
+                  # AWS-named GATEWAY_IAM_ROLE value is retained as a served,
+                  # DEPRECATED alias so existing CRs keep validating; new CRs
+                  # should use `providerManaged`. Default flipped from the
+                  # AWS-named GATEWAY_IAM_ROLE to the neutral NONE so a non-AWS
+                  # ToolConfig no longer silently carries an AWS credential mode.
+                  enum: [NONE, providerManaged, API_KEY, OAUTH, GATEWAY_IAM_ROLE]
+                  default: NONE
+                  description: "Neutral credential scope policy. NONE | providerManaged (broker-injected identity) | API_KEY | OAUTH. GATEWAY_IAM_ROLE is a DEPRECATED AWS-named alias for providerManaged (agentCoreGateway). Type only — actual secret referenced by credentialSecretRef."
+                credentialSecretRef:
+                  type: string
+                  maxLength: 253
+                  description: "Name of Kubernetes Secret holding credentials. Required when credentialProviderType != NONE and != GATEWAY_IAM_ROLE. Credentials NEVER inline in CRD."
+                dependsOn:
+                  type: object
+                  description: "Cross-asset dependency declarations. Operator gates approval until all refs exist and are Approved."
+                  properties:
+                    models:
+                      type: array
+                      items:
+                        type: string
+                        pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                        maxLength: 63
+                      maxItems: 10
+                      description: "ModelConfig aliases this tool calls (for RAG/agent-in-tool patterns)"
+
+                # ── Governance ──
+                governance:
+                  type: object
+                  description: "Governance metadata for this tool: ownership, data-classification, lifecycle/retirement, and the optional approval gate. Drives admission checks and the discovery-catalog record."
+                  properties:
+                    owner: { type: string }
+                    costCenter: { type: string }
+                    dataClassification:
+                      type: string
+                      enum: [public, internal, confidential, pii, regulated, restricted]
+                    retirementDate:
+                      type: string
+                      format: date
+                      description: "Planned retirement date. Operator transitions phase to Retired when reached."
+                    # ── Governance approval gate ──
+                    approval:
+                      type: object
+                      description: |
+                        Human/policy approval gate. When required=true,
+                        the AssetOperator parks the CR in phase=Reviewing until
+                        a signed attestation from the role declared in
+                        approverRole appears in status.governance.approvals[].
+                        Default for required flips on spec.safety.required so
+                        non-safety assets keep auto-approving.
+                      properties:
+                        required:
+                          type: boolean
+                          description: "When unset, defaults to spec.safety.required."
+                        requiredApprovals:
+                          type: integer
+                          minimum: 1
+                          default: 1
+                        approverRole:
+                          type: string
+                          description: "FQN role name. Defaults to modaas-toolconfig-<toolName>-admin."
+                          maxLength: 253
+
+                # ── Access control ──
+                access:
+                  type: object
+                  description: "Authorization policy for invoking this tool: the Cedar policy that grants/forbids agent->tool calls and the PDP engine that enforces it. The tool side is the grant-capable (permit) authority for its actions."
+                  x-kubernetes-validations:
+                    # ── PDP policy-projection invariant ──
+                    # agentPolicy.engine.cedar requires a grant-capable policy
+                    # source. cedarPolicy is the inline grant-capable PRIMARY
+                    # (resource side). If an agentPolicy.engine.cedar block is
+                    # declared it must either carry an explicit policyId OR rely on
+                    # cedarPolicy being present (policyId is then derived from the
+                    # CR name by the operator).
+                    - rule: |
+                        !has(self.agentPolicy) || !has(self.agentPolicy.engine)
+                        || !has(self.agentPolicy.engine.cedar)
+                        || has(self.agentPolicy.engine.cedar.policyId)
+                        || has(self.cedarPolicy)
+                      message: "access.agentPolicy.engine.cedar requires either an explicit policyId or an inline access.cedarPolicy; policyId is derived from the CR name when unset (agent-action policy contract)."
+                  properties:
+                    requiredRole:
+                      type: string
+                      description: "Keycloak/Istio role required to invoke tools"
+                    cedarPolicy:
+                      type: string
+                      description: |
+                        Inline Cedar policy document — the grant-capable PRIMARY
+                        (resource side). When present, the aws-tool-operator projects
+                        this text into a label-scoped ConfigMap in modaas-system
+                        (app.kubernetes.io/part-of=modaas-pdp) so the in-cluster PDP
+                        hot-loads it, and the AI Gateway tool path calls
+                        POST <pdp>/decide on every invocation, fail-closed (reserved
+                        for future sibling implementations; the self/reference path is
+                        what ships today). If access.agentPolicy.engine.cedar.policyId
+                        is unset, the policyId is derived from the CR name
+                        (modaas-toolconfig-<name>).
+                    # ── PDP wiring (tool path policy enforcement) ──
+                    agentPolicy:
+                      type: object
+                      description: |
+                        Declares HOW the inline cedarPolicy is enforced at
+                        runtime. Principal=agent (JWT sub / SigV4 identity),
+                        action=invoke, resource=this tool. Optional — when omitted,
+                        MoDaaS enforcement is off for this tool (default behavior
+                        unchanged). Presence (alongside cedarPolicy) opts the tool
+                        into PDP enforcement on the tool path.
+                      properties:
+                        engine:
+                          type: object
+                          description: "Policy engine selector. Only cedar is supported today."
+                          properties:
+                            cedar:
+                              type: object
+                              description: "Cedar PDP wiring for this tool."
+                              properties:
+                                pdpRef:
+                                  type: string
+                                  default: "modaas-pdp.modaas-system.svc.cluster.local:8080"
+                                  maxLength: 253
+                                  description: |
+                                    Service reference to the in-cluster PDP.
+                                    Defaults to the standard modaas-pdp ClusterIP.
+                                    The AI Gateway calls POST http://<pdpRef>/decide.
+                                policyId:
+                                  type: string
+                                  maxLength: 253
+                                  description: |
+                                    Explicit Cedar policyId the operator stamps on
+                                    the projected ConfigMap and the gateway sends
+                                    in the /decide request body. When unset, the
+                                    operator derives it from the CR name
+                                    (modaas-toolconfig-<name>) — see cedarPolicy.
+
+                # ── AgentCore Gateway (AWS reference) ──
+                agentCoreGateway:
+                  type: object
+                  description: "Provider-specific configuration when provider=agentCoreGateway (the managed MCP gateway that fronts this tool backend). Exactly one provider block must match spec.provider (CEL-enforced)."
+                  x-kubernetes-validations:
+                    # A ToolConfig must EITHER adopt an existing target OR declare a
+                    # backing. Valid backings:
+                    #   - mcpServer (lambda ARN or http(s) URL with tools[] or native MCP)
+                    #   - apiGateway (existing REST API)
+                    #   - smithyModel (inline or s3)
+                    #   - openApiSchema (inline or s3)
+                    - rule: |
+                        has(self.adoptTargetId)
+                        || has(self.apiGateway)
+                        || has(self.smithyModel)
+                        || has(self.openApiSchema)
+                        || has(self.tools)
+                        || (has(self.mcpServer) && has(self.mcpServer.endpoint)
+                            && (self.mcpServer.endpoint.startsWith("https://")
+                                || self.mcpServer.endpoint.startsWith("http://")
+                                || self.mcpServer.endpoint.startsWith("arn:aws:lambda:")))
+                      message: "agentCoreGateway requires one of: adoptTargetId / apiGateway / smithyModel / openApiSchema / tools[] / mcpServer.endpoint=http(s)://|arn:aws:lambda:"
+                    - rule: "!has(self.adoptTargetId) || has(self.gatewayIdentifier)"
+                      message: "adoptTargetId requires gatewayIdentifier (which gateway hosts the adopted target)"
+                    # Provider-mismatch could slip CEL because the backing-presence
+                    # rule above was an OR across all backings. Tighten with
+                    # per-backing structural invariants so that asserting a backing
+                    # block actually means the block is valid.
+                    # ── mcpServer must carry an http(s) endpoint or Lambda ARN when present ──
+                    # Some ToolConfigs wrap Lambda backends and store the Lambda ARN
+                    # in mcpServer.endpoint. A rule that required http(s):// alone
+                    # rejected every status patch for those, freezing last-reconciled.
+                    # Permit the arn:aws:lambda: prefix alongside http(s)://. Keep
+                    # blocking obviously-broken values (ftp://, empty strings,
+                    # malformed scheme) by requiring the endpoint to start with one of
+                    # the three accepted prefixes.
+                    - rule: "!has(self.mcpServer) || (has(self.mcpServer.endpoint) && (self.mcpServer.endpoint.startsWith('https://') || self.mcpServer.endpoint.startsWith('http://') || self.mcpServer.endpoint.startsWith('arn:aws:lambda:')))"
+                      message: "agentCoreGateway.mcpServer requires endpoint starting with http://, https://, or arn:aws:lambda:"
+                    # ── tools[], when declared, must be non-empty ──
+                    # Empty arrays were slipping the OR-chain via has(self.tools)
+                    # because CEL's has() returns true for [].
+                    - rule: "!has(self.tools) || size(self.tools) > 0"
+                      message: "agentCoreGateway.tools must contain at least one tool when declared (use adoptTargetId for managed-target adoption with no inline tools)"
+                  properties:
+                    # ── ADOPT MODE ──
+                    # When adoptTargetId is set the operator does NOT create a
+                    # new Gateway target. It reads the existing target by ID,
+                    # writes observed tools to status, registers a Registry
+                    # record, and never mutates or deletes the backing target.
+                    # This makes the "zero-code governance overlay" thesis true
+                    # for pre-existing Gateway deployments.
+                    adoptTargetId:
+                      type: string
+                      description: |
+                        Existing Gateway target ID to adopt. Operator never
+                        creates, updates, or deletes this target. Use with
+                        gatewayIdentifier to identify the host gateway.
+                        Mutually exclusive with managed-mode (tools[] required)
+                        in spec semantics though not CEL-enforced (tools[] can
+                        still be declared for governance record documentation
+                        even in adopt mode — observed tools from Gateway win).
+                      minLength: 1
+                    # ── END ADOPT MODE ──
+                    # ─── credentialProviderConfigurations pass-through ───
+                    # AgentCore Gateway supports 4 credential provider types for target
+                    # invocation. Default GATEWAY_IAM_ROLE works for Lambda + native
+                    # mcpServer targets; OAUTH and API_KEY unlock protected HTTP backends.
+                    credentialProviderType:
+                      type: string
+                      enum: [GATEWAY_IAM_ROLE, OAUTH, API_KEY, JWT_PASSTHROUGH, CALLER_IAM_CREDENTIALS, NONE]
+                      default: GATEWAY_IAM_ROLE
+                      description: |
+                        Credential provider AgentCore Gateway uses when invoking this target.
+
+                        AWS-native values (passed through verbatim):
+                          GATEWAY_IAM_ROLE        Gateway's own IAM role (default for Lambda)
+                          OAUTH                   Registered OAuth provider ARN
+                          API_KEY                 API key header/query param
+                          JWT_PASSTHROUGH         Caller's JWT forwarded verbatim
+                          CALLER_IAM_CREDENTIALS  Caller's IAM credentials forwarded
+
+                        MoDaaS virtual value:
+                          NONE  Omit credentialProviderConfigurations entirely. Valid
+                                only for mcpServer targets against public no-auth
+                                servers (e.g. aws-knowledge-mcp-server).
+                    credentialProvider:
+                      type: object
+                      description: "Provider-specific credential configuration. Shape depends on credentialProviderType."
+                      x-kubernetes-preserve-unknown-fields: true
+                      properties:
+                        oauthCredentialProvider:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                          properties:
+                            providerArn:
+                              type: string
+                              description: "ARN of the OAuth credential provider registered in AgentCore."
+                            scopes:
+                              type: array
+                              items: { type: string }
+                            grantType:
+                              type: string
+                              enum: [CLIENT_CREDENTIALS, AUTHORIZATION_CODE]
+                        apiKeyCredentialProvider:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                          properties:
+                            providerArn:
+                              type: string
+                              description: "ARN of the API key credential provider registered in AgentCore."
+                            credentialParameterName:
+                              type: string
+                              description: "Name of the header/query param carrying the API key."
+                            credentialLocation:
+                              type: string
+                              enum: [HEADER, QUERY]
+                              default: HEADER
+                    # ─── Explicit backing blocks ───
+                    # AgentCore Gateway supports 5 native targetConfiguration.mcp types
+                    # beyond mcpServer+lambda. These fields declare them explicitly so
+                    # the operator doesn't have to infer from mcpServer.endpoint.
+                    apiGateway:
+                      type: object
+                      description: |
+                        Wrap an existing AWS API Gateway REST API as governed MCP tools.
+                        Operator dispatches to targetConfiguration.mcp.apiGateway.
+                      required: [restApiId]
+                      properties:
+                        restApiId:
+                          type: string
+                          description: "AWS API Gateway REST API id (e.g. abcd1234ef)"
+                          minLength: 1
+                        stage:
+                          type: string
+                          description: "API Gateway stage name. Default: prod."
+                          default: prod
+                        apiGatewayToolConfiguration:
+                          type: object
+                          description: "Optional per-tool overrides and path filters."
+                          x-kubernetes-preserve-unknown-fields: true
+                    smithyModel:
+                      type: object
+                      description: |
+                        Smithy-defined service. Inline JSON OR S3-backed model file.
+                        Operator dispatches to targetConfiguration.mcp.smithyModel.
+                      x-kubernetes-preserve-unknown-fields: true
+                      properties:
+                        inlinePayload:
+                          type: string
+                          description: "Smithy model as inline JSON string."
+                        s3:
+                          type: object
+                          properties:
+                            uri: { type: string }
+                            bucketOwnerAccountId: { type: string }
+                    openApiSchema:
+                      type: object
+                      description: |
+                        OpenAPI spec explicitly declared (separate from
+                        mcpServer.endpoint inference). Inline JSON string OR S3.
+                        Operator dispatches to targetConfiguration.mcp.openApiSchema.
+                      x-kubernetes-preserve-unknown-fields: true
+                      properties:
+                        inlinePayload:
+                          type: string
+                          description: "OpenAPI spec as inline JSON string."
+                        s3:
+                          type: object
+                          properties:
+                            uri: { type: string }
+                            bucketOwnerAccountId: { type: string }
+                    mcpServer:
+                      type: object
+                      description: |
+                        Lambda ARN or remote http(s) MCP URL. Operator infers Lambda
+                        vs native-mcpServer vs OpenAPI dispatch from the endpoint.
+                        Not required if apiGateway/smithyModel/openApiSchema is declared.
+                      properties:
+                        endpoint:
+                          type: string
+                          minLength: 1
+                        transport:
+                          type: string
+                          enum: [streamable-http, sse, stdio]
+                          default: streamable-http
+                    tools:
+                      type: array
+                      minItems: 0
+                      description: |
+                        Inline tool schemas. REQUIRED for Lambda and openApiSchema target
+                        types. OPTIONAL for native mcpServer targets (endpoint starts with
+                        https:// + transport is streamable-http/sse) — the remote MCP server
+                        declares its own tools via the MCP handshake.
+                      items:
+                        type: object
+                        required: ["name", "description", "inputSchema"]
+                        properties:
+                          name:
+                            type: string
+                            minLength: 1
+                          description:
+                            type: string
+                          inputSchema:
+                            type: object
+                            required: ["type"]
+                            x-kubernetes-preserve-unknown-fields: true
+                            properties:
+                              type:
+                                type: string
+                    gatewayIdentifier:
+                      type: string
+
+                # ── Custom (escape valve) ──
+                # Genuine escape hatch: preserve-unknown-fields lets a sibling
+                # operator round-trip arbitrary provider-specific config (gateway
+                # ids, transports, region, per-tool schema) without a CRD bump.
+                # Without this, K8s silently strips any field beyond the four typed
+                # ones below, making `custom` admission-only paperwork.
+                custom:
+                  type: object
+                  description: "Provider-specific configuration when provider=custom (a non-AgentCore tool backend). Open-contract escape hatch realized by a sibling operator; fields are provider-defined. Exactly one provider block must match spec.provider (CEL-enforced)."
+                  x-kubernetes-preserve-unknown-fields: true
+                  properties:
+                    baseUrl: { type: string, example: "https://tools.example.com/mcp" }
+                    authHeader: { type: string }
+                    authSecretRef: { type: string }
+                    protocol:
+                      type: string
+                      enum: [mcp, openapi, custom]
+                      example: mcp
+
+            # ═════════════════════════════════════════════════════════════════
+            # STATUS
+            # ═════════════════════════════════════════════════════════════════
+            status:
+              type: object
+              x-kubernetes-validations:
+                # globalResourceEndpoint immutability rule deferred — the field is
+                # still being shaped (path scheme, scope semantics) and operator drift
+                # corrections need to land. Re-add once a stable contract is published.
+                # Warn (not refuse) if globalResourceEndpoint missing when Approved
+                - rule: |
+                    !has(self.phase) || self.phase != 'Approved' || has(self.globalResourceEndpoint)
+                  message: "status.globalResourceEndpoint should be set when phase=Approved (warning only)"
+                # ── Claim-verification admission CEL invariants ──
+                # Deferred: globalResourceEndpoint scope vs consumers.
+                #   Activate once status.boundPublicConsumers (list) is added.
+                #   Intent: refuse Approved + endpointScope=mesh when public-vantage
+                #   consumers are bound. K8s CEL rejects unknown structural-schema
+                #   field paths even when has()-guarded, so this rule lands with the field.
+                # Deferred: IdentityProvisioned=True ↔ non-empty
+                #   status.identityConfigRef. Activate once identityConfigRef is
+                #   promoted into the status schema. Until then operator-owned.
+              properties:
+                # ── kopf handler results ─────────────────────────────────────────────
+                # kopf persists each handler's RETURN VALUE at status.<handler_id>. These were not
+                # declared, and status has no x-kubernetes-preserve-unknown-fields, so the API stripped
+                # them and every reconcile logged:
+                #   Patching failed with inconsistencies: (('remove', ('status','reconcile'), ...))
+                # That warning is identical whether the dropped field is kopf bookkeeping or a field the
+                # operator genuinely meant to publish, so a constant benign version of it cannot warn about
+                # the dangerous one. Declared explicitly rather than via preserve-unknown-fields so a
+                # genuinely mistyped status key still gets rejected.
+                reconcile:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for reconcile() — diagnostic, not API surface.
+                resync_from_registry:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for resync_from_registry() — diagnostic, not API surface.
+                scan_orphan_records:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for scan_orphan_records() — diagnostic, not API surface.
+                cleanup:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for cleanup() — diagnostic, not API surface.
+                phase:
+                  type: string
+                  # Reviewing added between Pending and Approved.
+                  enum: [Pending, Reviewing, Approved, Active, Failed, Paused, Retired]
+                reason: { type: string, maxLength: 512 }
+                observedGeneration: { type: integer }
+                lastReconciled: { type: string, format: date-time }
+                gatewayTargetId: { type: string }
+                registryRecordId:
+                  type: string
+                  description: "Governance-registry record key. Convention: <provider>_<asset_id>, both halves normalized (lowercase, '_'->'-', leading-alpha). Unified pattern across ModelConfig/ToolConfig/AgentConfig."
+                  pattern: "^[a-z][a-z0-9-]*_[a-z][a-z0-9-]*$"
+                registryApprovalStatus:
+                  type: string
+                  description: "Observed registry state from timer-driven resync."
+                  enum: [APPROVED, DRAFT, PENDING, DEPRECATED, MISSING, UNKNOWN]
+                # ── Registry backing reference (status mirror) ──
+                registryBackingRef:
+                  type: object
+                  description: "Observed backing that received this asset's record at last reconcile."
+                  properties:
+                    name:
+                      type: string
+                      description: "Registry CR name that was resolved."
+                    backing:
+                      type: string
+                      description: "Backing kind (agentcore | tmf639 |...)."
+                    recordId:
+                      type: string
+                      description: "Backing-specific record id (e.g., AgentCore recordId)."
+                    observedAt:
+                      type: string
+                      format: date-time
+                registryLastObserved:
+                  type: string
+                  format: date-time
+                  description: "Wall-clock time of last resync from registry (@timer every 5 min)."
+                driftDetected:
+                  type: boolean
+                  description: "True when CR state contradicts registry state."
+                driftReason:
+                  type: string
+                  maxLength: 256
+                  description: "Human-readable explanation when driftDetected=true."
+                tmf639ResourceId:
+                  type: string
+                  description: "TMF639 Resource ID from Canvas Resource Inventory v5."
+                daysUntilRetirement: { type: integer }
+                safetyEnabled: { type: boolean }
+                # ── Governance perimeter URL ──
+                # The operator writes status.endpoint; this property MUST be
+                # declared here or K8s silently strips the write — every status
+                # field an operator sets needs a matching schema declaration.
+                endpoint:
+                  type: string
+                  description: "Governed runtime URL agents MUST call. Per-wire-format path (e.g. .../mcp/<alias>). Status-driven discovery clients read THIS, not upstreamEndpoint, to stay on the governed path."
+                # Per-scope governed endpoint map {scope: url} the operator publishes
+                # via the shared perimeter-URL helper. Open object (dynamic scope keys)
+                # — declared so K8s does not silently strip the operator's write.
+                endpoints:
+                  type: object
+                  description: "Per-scope governed endpoint URLs the operator resolved for this asset. The single best one is mirrored to status.endpoint."
+                  x-kubernetes-preserve-unknown-fields: true
+                upstreamEndpoint:
+                  type: string
+                  description: "Raw provider URL behind the gateway (AgentCore Gateway MCP URL). Diagnostics only — agents that call this directly bypass MoDaaS governance and enforcement."
+                # ── PDP policy projection ──
+                # Operator writes status.access.pdpPolicyId after projecting the
+                # inline cedarPolicy into the PDP-watched ConfigMap. Declared here
+                # so K8s does not silently strip the write at default verbosity.
+                access:
+                  type: object
+                  description: "Observed access-enforcement state for this tool."
+                  properties:
+                    pdpPolicyId:
+                      type: string
+                      maxLength: 253
+                      description: |
+                        Cedar policyId the operator projected to the in-cluster PDP
+                        (label-scoped ConfigMap in modaas-system). Empty when no
+                        inline access.cedarPolicy is declared. The AI Gateway tool
+                        path sends this id in POST <pdp>/decide.
+                # ── Global Resource Endpoint + scope ──
+                globalResourceEndpoint:
+                  type: string
+                  format: uri
+                  description: |
+                    Stable, externally-resolvable URL representing the governance perimeter
+                    for this asset. Set by operator on transition to Approved. Immutable
+                    thereafter. Format: https://<gateway-host>/<wire-format>/<asset-uid>.
+                endpointScope:
+                  type: string
+                  enum: [mesh, vpc, public]
+                  description: |
+                    Resolvable scope of globalResourceEndpoint. mesh = cluster-internal only;
+                    vpc = VPC-internal; public = externally addressable.
+                componentRef:
+                  type: object
+                  description: "Canvas Component CR that owns this asset (set by operator after Component emission)."
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    uid:
+                      type: string
+                tmf639Resource:
+                  type: object
+                  description: "TMF639 v5 Resource Inventory record this asset projects to."
+                  properties:
+                    id:
+                      type: string
+                      description: "Stable TMF639 resource ID."
+                    url:
+                      type: string
+                      format: uri
+                      description: "Direct URL to the TMF639 record (e.g., RI baseUrl + /resource/{id})."
+                audit:
+                  type: object
+                  description: "Addressable audit pointers for this asset."
+                  properties:
+                    logGroup:
+                      type: string
+                      description: "CloudWatch log group name."
+                    queryUrl:
+                      type: string
+                      format: uri
+                      description: "Pre-built CloudWatch Logs Insights query URL."
+                # ── Adopt vs Managed mode observability ──
+                managed:
+                  type: boolean
+                  description: "True if operator created the Gateway target (managed mode); false if adopted."
+                gatewayIdentifier:
+                  type: string
+                  description: "The Gateway hosting the target (set in both managed and adopt modes)."
+                observedTools:
+                  type: array
+                  description: "Tools observed on the adopted Gateway target (adopt mode only). Populated from get_gateway_target."
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                    properties:
+                      name: { type: string }
+                      description: { type: string }
+                # ── Governance approval audit trail ──
+                governance:
+                  type: object
+                  description: "Governance approval state (Reviewing → Approved gate)."
+                  properties:
+                    approvals:
+                      type: array
+                      description: "Append-only list of signed approval attestations."
+                      items:
+                        type: object
+                        required: [subject, role, at]
+                        properties:
+                          subject: { type: string, maxLength: 253 }
+                          role: { type: string, maxLength: 253 }
+                          attestation: { type: string, maxLength: 2048 }
+                          signature: { type: string, maxLength: 4096 }
+                          at: { type: string, format: date-time }
+                    awaitingSince:
+                      type: string
+                      format: date-time
+                      nullable: true
+                    rejectedAt:
+                      type: string
+                      format: date-time
+                      nullable: true
+                    rejectedReason:
+                      type: string
+                      maxLength: 256
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: { type: string }
+                      status: { type: string, enum: ["True", "False", "Unknown"] }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string, format: date-time }
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - { name: Tool,     type: string,  jsonPath: .spec.toolName }
+        - { name: Provider, type: string,  jsonPath: .spec.provider }
+        - { name: Phase,    type: string,  jsonPath: .status.phase }
+        - { name: Mode,     type: string,  jsonPath: .status.managed, priority: 1, description: "managed (operator-provisioned) or adopt (existing resource)" }
+        - { name: Paused,   type: boolean, jsonPath: .spec.paused, priority: 1 }
+        - { name: Retire,   type: integer, jsonPath: .status.daysUntilRetirement, priority: 1 }
+        - { name: Reason,   type: string,  jsonPath: .status.reason, priority: 1 }
+        - { name: Reg,      type: string,  jsonPath: .status.registryApprovalStatus, priority: 1 }
+        - { name: Drift,    type: boolean, jsonPath: .status.driftDetected, priority: 1 }
+        - { name: Registry, type: string, jsonPath: .spec.registryRef.name, priority: 1 }
+        - { name: Global-Endpoint, type: string, jsonPath: .status.globalResourceEndpoint, priority: 1 }
+        - { name: Scope, type: string, jsonPath: .status.endpointScope, priority: 1 }
+
+        - { name: Age,      type: date,    jsonPath: .metadata.creationTimestamp }

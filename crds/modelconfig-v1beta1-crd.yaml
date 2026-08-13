@@ -1,0 +1,1189 @@
+# ModelConfig — Open-contract CRD for ODA Canvas model lifecycle
+# =============================================================================
+# Namespace-scoped CRD declaring one foundation model's identity, capabilities,
+# safety intent, governance metadata, and provider-specific configuration.
+#
+# Provider-agnostic at the root; provider-specific only within typed sub-blocks.
+# CEL rules enforce exactly-one typed block matching spec.provider, plus
+# immutability of the identity triple {alias, provider, modelId}.
+#
+# Extension protocol for new providers: add one typed sub-block + one CEL rule
+# pair (requirement + exclusivity). No fork, no second CRD.
+# =============================================================================
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: modelconfigs.oda.tmforum.org
+  labels:
+    app.kubernetes.io/part-of: modaas-canvas
+  annotations:
+    oda.tmforum.org/crd-version: "v1beta1"
+    # Declarative spec lineage — ties this CRD to the TMF specification it
+    # realizes, the way ODA Canvas CRDs cite TMF6xx / SID. This is the first
+    # concrete implementation of GB1085 §4 Canvas Operator Requirements.
+    oda.tmforum.org/spec-sdo: "TMForum"
+    oda.tmforum.org/specification: "GB1085 Model-as-a-Service v1.0.0"
+    oda.tmforum.org/spec-section: "GB1085 §2.2 + §4"
+    oda.tmforum.org/governed-asset: "model"
+spec:
+  group: oda.tmforum.org
+  scope: Namespaced
+  names:
+    plural: modelconfigs
+    singular: modelconfig
+    kind: ModelConfig
+    shortNames: [mc]
+  conversion:
+    strategy: None
+  versions:
+    # ── legacy alpha versions: not served by default (kept here for migration) ──
+    - name: v1alpha1
+      served: false
+      storage: false
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+    - name: v1alpha2
+      served: false
+      storage: false
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+    # ── current storage version ──
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: "Governs one foundation model (LLM) as a declarative Kubernetes resource: onboarding, safety/guardrail intent, lifecycle (approve/pause/retire), and publication to a discovery catalog. An operator reconciles this spec against a backing provider (AWS Bedrock by default; others pluggable via sibling operators, no CRD change). Agents reach the model through the MoDaaS AI Gateway — a reverse-proxy pod that enforces this asset's policy on every call (see status.endpoint). Runs on ODA Canvas, TM Forum's open telco-platform framework; this realizes GB1085 §2.2 (service functionality) + §4 Canvas Operator Requirements. TMF639/SID references are optional standards metadata."
+          required: ["spec"]
+          x-kubernetes-validations:
+            # ── Governance Approval Gate invariants ──
+            # 1. Approval count gate: phase=Approved requires at least
+            #    requiredApprovals signed attestations when approval is required.
+            - rule: |
+                !has(self.status) || !has(self.status.phase) || self.status.phase != 'Approved'
+                || !has(self.spec.governance) || !has(self.spec.governance.approval)
+                || !has(self.spec.governance.approval.required)
+                || self.spec.governance.approval.required != true
+                || (has(self.status.governance) && has(self.status.governance.approvals)
+                    && size(self.status.governance.approvals) >=
+                       (has(self.spec.governance.approval.requiredApprovals) ? self.spec.governance.approval.requiredApprovals : 1))
+              message: "phase=Approved with governance.approval.required=true requires at least requiredApprovals signed attestations in status.governance.approvals[] (governance approval gate)."
+            # 2. Safety-required assets must opt INTO approval gating.
+            #    Grandfather: this is a TRANSITION rule — it demands approval
+            #    only when the safety posture is NEWLY set on create, or when
+            #    spec.safety changes on update. A pre-existing CR whose safety
+            #    block is unchanged is grandfathered, so admission never rejects
+            #    an already-Approved asset on operator status-touch or annotate
+            #    re-apply (admission fires before the operator's grandfather
+            #    check can run).
+            - rule: |
+                !(has(self.spec.safety) && has(self.spec.safety.required) && self.spec.safety.required == true)
+                || (oldSelf.hasValue() && has(oldSelf.value().spec.safety) && oldSelf.value().spec.safety == self.spec.safety)
+                || (has(self.spec.governance) && has(self.spec.governance.approval)
+                    && has(self.spec.governance.approval.required)
+                    && self.spec.governance.approval.required == true)
+              optionalOldSelf: true
+              message: "spec.safety.required=true demands spec.governance.approval.required=true — no silent auto-approve; pre-existing assets with unchanged safety are grandfathered (governance approval gate)."
+            # 3. Approver role match: every approval record's role must match
+            #    spec.governance.approval.approverRole when explicitly set.
+            - rule: |
+                !has(self.status) || !has(self.status.governance)
+                || !has(self.status.governance.approvals)
+                || !has(self.spec.governance) || !has(self.spec.governance.approval)
+                || !has(self.spec.governance.approval.approverRole)
+                || self.status.governance.approvals.all(a, !has(a.role) || a.role == self.spec.governance.approval.approverRole)
+              message: "every status.governance.approvals[].role must match spec.governance.approval.approverRole (governance approval gate)."
+          properties:
+            spec:
+              type: object
+              description: "Desired state of the governed model: identity (alias/provider/modelId), capabilities, safety enforcer, governance, and provider-specific config."
+              required: ["alias", "provider", "modelId"]
+              x-kubernetes-validations:
+                # ── Credential handling: REFERENCED, never inline (G50) ──
+                # The credentialSecretRef description already said "Credentials NEVER inline in CRD".
+                # A description is documentation, not a guardrail — nothing rejected a violation, so an
+                # API_KEY asset could be admitted with no secret reference at all and the operator would
+                # discover it at reconcile time, or worse a caller could stuff the key somewhere else.
+                # These rules make the API refuse it.
+                - rule: "!(self.credentialProviderType in ['API_KEY','OAUTH']) || (has(self.credentialSecretRef) && self.credentialSecretRef != '')"
+                  message: "credentialProviderType API_KEY or OAUTH requires spec.credentialSecretRef — credentials are REFERENCED from a Secret, never inline"
+                # A secret ref with no credential type is a contradiction: it declares a credential the
+                # system will never load, which reads as configured auth while none is in force.
+                - rule: "!has(self.credentialSecretRef) || self.credentialSecretRef == '' || self.credentialProviderType in ['API_KEY','OAUTH']"
+                  message: "spec.credentialSecretRef is set but credentialProviderType is NONE/providerManaged — the secret would never be loaded"
+                # ── Requirement rules: declared provider MUST have its block ──
+                - rule: "self.provider != 'aws-bedrock' || has(self.awsBedrock)"
+                  message: "provider=aws-bedrock requires spec.awsBedrock block"
+                - rule: "self.provider != 'aws-sagemaker' || has(self.awsSageMaker)"
+                  message: "provider=aws-sagemaker requires the spec.awsSageMaker block (SageMaker provider)"
+                - rule: "self.provider != 'azure-openai' || has(self.azureOpenAI)"
+                  message: "provider=azure-openai requires spec.azureOpenAI block"
+                - rule: "self.provider != 'google-vertex' || has(self.googleVertex)"
+                  message: "provider=google-vertex requires spec.googleVertex block"
+                - rule: "self.provider != 'databricks' || has(self.databricks)"
+                  message: "provider=databricks requires spec.databricks block"
+                - rule: "self.provider != 'nvidia-nim' || has(self.nvidiaNIM)"
+                  message: "provider=nvidia-nim requires spec.nvidiaNIM block"
+                - rule: "self.provider != 'ollama' || has(self.ollama)"
+                  message: "provider=ollama requires spec.ollama block"
+                - rule: "self.provider != 'custom' || has(self.custom)"
+                  message: "provider=custom requires spec.custom block"
+                # ── Exclusivity rules: no other provider's block may be present ──
+                - rule: "self.provider == 'aws-bedrock' || !has(self.awsBedrock)"
+                  message: "spec.awsBedrock only allowed when provider=aws-bedrock"
+                - rule: "self.provider == 'aws-sagemaker' || !has(self.awsSageMaker)"
+                  message: "spec.awsSageMaker only allowed when provider=aws-sagemaker"
+                - rule: "self.provider == 'azure-openai' || !has(self.azureOpenAI)"
+                  message: "spec.azureOpenAI only allowed when provider=azure-openai"
+                - rule: "self.provider == 'google-vertex' || !has(self.googleVertex)"
+                  message: "spec.googleVertex only allowed when provider=google-vertex"
+                - rule: "self.provider == 'databricks' || !has(self.databricks)"
+                  message: "spec.databricks only allowed when provider=databricks"
+                - rule: "self.provider == 'nvidia-nim' || !has(self.nvidiaNIM)"
+                  message: "spec.nvidiaNIM only allowed when provider=nvidia-nim"
+                - rule: "self.provider == 'ollama' || !has(self.ollama)"
+                  message: "spec.ollama only allowed when provider=ollama"
+                - rule: "self.provider == 'custom' || !has(self.custom)"
+                  message: "spec.custom only allowed when provider=custom"
+                # ── Provider-locked enforcer kinds ──
+                # bedrockGuardrail (in-Converse) requires Bedrock; cross-provider
+                # safety must use bedrockGuardrailExternal.
+                # The operator already refuses this — admission catches it earlier
+                # so users see the violation at apply-time.
+                - rule: "!has(self.safety) || !has(self.safety.enforcer) || self.safety.enforcer.kind != 'bedrockGuardrail' || self.provider == 'aws-bedrock'"
+                  message: "safety.enforcer.kind=bedrockGuardrail (Bedrock-native, in-Converse) requires provider=aws-bedrock; use bedrockGuardrailExternal for other providers (provider-agnostic guardrail)"
+                # ── Immutability of identity triple ──
+                # Once created, these cannot change. Governance: approver signed
+                # off on this specific tuple; changing would invalidate approval
+                # and orphan registry records.
+                - rule: "oldSelf.alias == self.alias"
+                  message: "spec.alias is immutable after creation"
+                - rule: "oldSelf.provider == self.provider"
+                  message: "spec.provider is immutable after creation"
+                - rule: "oldSelf.modelId == self.modelId"
+                  message: "spec.modelId is immutable after creation"
+                # registryRef selects the discovery-catalog backing (Registry CR).
+                # Immutable after creation: silently re-homing an asset's records
+                # to a different catalog would orphan the prior registry's records
+                # and break audit provenance (same governance rationale as the
+                # identity triple). Optional field, so guard both has() sides.
+                - rule: "!has(oldSelf.registryRef) || !has(self.registryRef) || oldSelf.registryRef == self.registryRef"
+                  message: "spec.registryRef is immutable after creation"
+                # ── Endpoint semantics ──
+                # aws-bedrock: endpoint optional (operator derives from region).
+                # All other providers: endpoint required (no region-derivation path).
+                - rule: "self.provider == 'aws-bedrock' || has(self.endpoint)"
+                  message: "spec.endpoint is required for all providers except aws-bedrock (which derives from region)"
+              properties:
+                # ── Identity ──
+                alias:
+                  type: string
+                  description: "Stable, human-friendly model name that consumers reference (e.g. an agent calls 'noc-llm', not the raw provider model id). Immutable after creation; resolved by the gateway to the provider modelId at invocation time."
+                  pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                  maxLength: 63
+                  minLength: 1
+                  example: noc-llm
+                provider:
+                  type: string
+                  # OPEN CONTRACT: provider is an open pattern, NOT a closed enum.
+                  # Eight typed provider blocks ship with paired
+                  # requirement/exclusivity CEL (aws-bedrock + aws-sagemaker wired in the
+                  # AWS reference operator; azure-openai/google-vertex/databricks/
+                  # nvidia-nim/ollama/custom are contract-ready for sibling operators).
+                  # A new provider adds one typed block + one CEL pair — no CRD fork.
+                  # The CEL rules short-circuit on `provider != <block>`, so an
+                  # unenumerated provider with no typed block validates and is owned by
+                  # whichever sibling operator recognizes it (community scope).
+                  pattern: "^[a-z][a-z0-9-]*$"
+                  default: aws-bedrock
+                  description: "Model backing provider. Open contract: aws-bedrock + aws-sagemaker ship in the AWS reference operator; azure-openai, google-vertex, databricks, nvidia-nim, ollama, custom are contract-ready; sibling operators add more without a CRD bump. example: aws-bedrock"
+                  example: aws-bedrock
+                modelId:
+                  type: string
+                  description: "Provider-native model identifier the alias resolves to (e.g. a Bedrock foundation-model id or inference-profile id). Immutable after creation. Interpreted per spec.provider."
+                  minLength: 1
+                  maxLength: 253
+                  example: "anthropic.claude-sonnet-4-5-20250929-v1:0"
+                # ── Declarative spec lineage (TMF/GB1085 conformance anchor) ──
+                # Optional. Lets a reviewer statically map this CR to the TMF spec
+                # section it realizes — the way ODA Canvas CRs cite TMF6xx / SID
+                # entities. Pure metadata; no operator behavior depends on it.
+                specLineage:
+                  type: object
+                  description: "Declarative TMF specification lineage for this asset (conformance anchor; ref: GB1085 §4)."
+                  properties:
+                    sdo: { type: string, default: "TMForum", example: "TMForum" }
+                    specification: { type: string, example: "GB1085 Model-as-a-Service v1.0.0" }
+                    section: { type: string, example: "§2.2.6 Active Content Guardrails" }
+                    sidEntity: { type: string, example: "LogicalResource" }
+                # ── Runtime endpoint (provider-neutral, top-level) ──
+                # Per the composition principle, endpoint answers one
+                # provider-neutral question — "where does the
+                # AI Gateway Pod route this model's inference traffic?". It belongs
+                # at the top of spec, not nested inside provider blocks.
+                #
+                # For provider=aws-bedrock: optional. If unset, the operator derives
+                # from spec.awsBedrock.region (https://bedrock-runtime.<region>.amazonaws.com)
+                # and writes the result to status.endpoint. Set explicitly only for
+                # PrivateLink/VPC interface endpoints, FIPS, or custom routing.
+                #
+                # For all other providers: required (enforced via CEL below).
+                endpoint:
+                  type: string
+                  format: uri
+                  description: >
+                    Runtime endpoint URL for the Gateway Pod to route inference traffic.
+                    Optional for provider=aws-bedrock (derived from awsBedrock.region);
+                    required for all other providers.
+                description:
+                  type: string
+                  description: "Free-text, human-readable description of this model and its intended use; surfaced in discovery catalogs and the registry record."
+                  maxLength: 512
+                paused:
+                  type: boolean
+                  default: false
+                  description: "If true, operator halts reconciliation (quarantine/debug)"
+
+                # ── Capability declaration ──
+                # ── Registry reference ──
+                # Points to a Registry CR that selects the backing catalog.
+                # Optional — defaults to the annotated default Registry in
+                # the operator namespace. Follows K8s PVC.storageClassName /
+                # Ingress.ingressClassName convention.
+                registryRef:
+                  type: object
+                  description: "Reference to the Registry CR that this asset publishes to."
+                  properties:
+                    name:
+                      type: string
+                      maxLength: 253
+                    namespace:
+                      type: string
+                      default: "modaas-system"
+                      maxLength: 63
+                capabilities:
+                  type: object
+                  description: >
+                    Capability declaration for agent discovery and routing.
+                    features[] is the single source of truth — polycapable
+                    models list all capabilities they support simultaneously.
+                  properties:
+                    features:
+                      type: array
+                      description: "All capabilities this model supports simultaneously"
+                      items:
+                        type: string
+                        enum:
+                          - chat
+                          - reasoning
+                          - embedding
+                          - vision
+                          - tool-use
+                          - streaming
+                          - code-generation
+                          - structured-output
+                          - audio
+                          - time-series
+                          - rerank
+                    modalities:
+                      type: array
+                      items: { type: string, enum: [text, image, audio, video] }
+                    minContextWindow:
+                      type: integer
+                      minimum: 1
+                      description: "Minimum viable context window in tokens"
+                    maxContextWindow:
+                      type: integer
+                      minimum: 1
+                      description: "Model's hard maximum context window"
+                    supportedMediaTypes:
+                      type: array
+                      description: "MIME types the model accepts"
+                      items:
+                        type: string
+                        pattern: "^[a-z]+/[a-zA-Z0-9.+-]+$"
+                    regions:
+                      type: array
+                      items: { type: string }
+                    tier:
+                      type: string
+                      enum: [economy, standard, premium, frontier]
+
+                # ── Safety (intent + policy reference) ──
+                safety:
+                  type: object
+                  description: "Content-safety governance for this model. Declares whether safety enforcement is required and which enforcer realizes it (e.g. a provider-native guardrail). Admission rejects a self-contradictory posture (e.g. required=true with enforcer.kind=none)."
+                  properties:
+                    required:
+                      type: boolean
+                      default: false
+                    policyRef:
+                      type: object
+                      description: "Typed reference (K8s objectReference convention). Kept for backward compatibility; prefer `safety.enforcer` for new configs."
+                      required: [kind, name]
+                      properties:
+                        kind:
+                          type: string
+                          enum: [ConfigMap, BedrockGuardrail, SafetyPolicy, ExternalRef]
+                        name: { type: string, minLength: 1 }
+                        namespace: { type: string }
+                    # ── Safety Enforcement Abstraction ──
+                    # Pluggable enforcer contract. The AI Gateway dispatches on
+                    # enforcer.kind at invocation time; operators dispatch at
+                    # reconcile time. When absent, behavior falls back to legacy
+                    # implicit bedrockGuardrail path (backward compat for
+                    # existing CRs that use awsBedrock.guardrails).
+                    enforcer:
+                      type: object
+                      description: "Safety enforcer. If omitted and safety.required=true with provider=aws-bedrock, legacy awsBedrock.guardrails path is used."
+                      properties:
+                        kind:
+                          type: string
+                          enum: [bedrockGuardrail, bedrockGuardrailExternal, gatewayFilter, external, none]
+                          description: "Enforcement mechanism. bedrockGuardrail=Bedrock-native in-Converse (provider=aws-bedrock only); bedrockGuardrailExternal=Bedrock ApplyGuardrail standalone (any provider); gatewayFilter=MoDaaS-internal (deferred); external=customer service; none=opt-out (only valid when safety.required=false)."
+                        # ── Enforcement driver axis (orthogonal to `kind`) ──
+                        # `kind` = WHAT kind of enforcement; `enforcedAt` = WHICH driver
+                        # realizes it. self = the MoDaaS AI Gateway (default, current
+                        # behavior). Other values federate to an external enforcement
+                        # driver behind the EnforcementDriver SPI (reserved for future
+                        # sibling implementations; the self/reference path is what ships
+                        # today). Additive: omitting it defaults to `self`, so existing
+                        # CRs are unchanged.
+                        enforcedAt:
+                          type: string
+                          pattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+                          # OPEN driver axis (SPI): NOT a closed enum, so a new
+                          # enforcement driver (Kong AI Gateway, Envoy AI Gateway, …)
+                          # federates without a CRD bump. Known values: self (MoDaaS AI
+                          # Gateway, default), agentgateway (Linux Foundation), muleSoftAiGateway
+                          # (the last two are reserved for future sibling implementations;
+                          # the self/reference path is what ships today).
+                          # The operator refuses a CR naming a driver it has no code for
+                          # (refuse-before-approve, parity with the gateway version-skew guard).
+                          default: self
+                          example: self
+                          description: "Enforcement driver — which gateway governs this asset's boundary. self=MoDaaS AI Gateway (default, the path that ships today); agentgateway=Linux Foundation agentgateway; muleSoftAiGateway=MuleSoft AI Gateway (these external drivers are reserved for future sibling implementations). Orthogonal to provider: names WHO enforces, not where the model lives."
+                        bedrockGuardrail:
+                          type: object
+                          description: "For kind=bedrockGuardrail. References or inlines Bedrock guardrail spec. If omitted, awsBedrock.guardrails is used (legacy path)."
+                          x-kubernetes-preserve-unknown-fields: true
+                        # ── Standalone Bedrock guardrail (provider-agnostic) ──
+                        bedrockGuardrailExternal:
+                          type: object
+                          description: "For kind=bedrockGuardrailExternal. Bedrock guardrail invoked via ApplyGuardrail API, decoupled from model invocation. Works for any provider (SageMaker, Ollama, vLLM, Databricks). The guardrail itself is still a Bedrock control-plane resource."
+                          properties:
+                            guardrailId:
+                              type: string
+                              description: "Bedrock guardrail identifier (BYO). When omitted, operator provisions one from awsBedrock.guardrails inline policy."
+                            guardrailVersion:
+                              type: string
+                              default: "DRAFT"
+                              description: "Guardrail version to apply. Defaults to DRAFT."
+                            applyTo:
+                              type: array
+                              description: "Enforcement directions: input (filter prompt before invoke), output (filter completion before return)."
+                              items:
+                                type: string
+                                enum: [input, output]
+                              default: [input, output]
+                            region:
+                              type: string
+                              pattern: "^[a-z]{2}-[a-z]+-[0-9]+$"
+                              description: "Bedrock region for ApplyGuardrail calls. Default: same region as the guardrail control-plane."
+                        external:
+                          type: object
+                          description: "For kind=external. Customer-owned safety service."
+                          required: [endpoint]
+                          properties:
+                            endpoint:
+                              type: string
+                              format: uri
+                              description: "HTTPS URL of the safety service. Must accept POST with MoDaaS safety check payload."
+                              minLength: 1
+                            timeoutMs:
+                              type: integer
+                              default: 500
+                              minimum: 100
+                              maximum: 10000
+                              description: "Max time to wait for safety decision. Exceeding = fail-closed."
+                            failOpen:
+                              type: boolean
+                              default: false
+                              description: "On unreachable/timeout: true=allow-through, false=deny. Default fail-closed."
+                            secretRef:
+                              type: object
+                              description: "Optional auth header secret."
+                              properties:
+                                name: { type: string, minLength: 1 }
+                                namespace: { type: string }
+                                key: { type: string, minLength: 1, default: "token" }
+                        gatewayFilter:
+                          type: object
+                          description: "For kind=gatewayFilter. MoDaaS-internal filters. Schema reserved; implementation deferred."
+                          x-kubernetes-preserve-unknown-fields: true
+                      x-kubernetes-validations:
+                        # The declared kind must have its corresponding config block
+                        - rule: "self.kind != 'external' || has(self.external)"
+                          message: "enforcer.kind=external requires safety.enforcer.external block"
+                        # kind=none is opt-out; requires required=false (checked at spec level below)
+                        # bedrockGuardrail block optional (legacy awsBedrock.guardrails fallback)
+                        # bedrockGuardrailExternal block optional (operator can provision from awsBedrock.guardrails)
+                        # ── Driver/kind pairing validation ──
+                        # bedrockGuardrail in-Converse is Bedrock-native — it cannot be
+                        # realized by an external driver. If enforcedAt federates to an
+                        # external gateway, kind must be a driver-portable kind.
+                        - rule: "!has(self.enforcedAt) || self.enforcedAt == 'self' || self.kind != 'bedrockGuardrail'"
+                          message: "enforcer.kind=bedrockGuardrail (Bedrock-native, in-Converse) requires enforcedAt=self; to federate to an external driver use bedrockGuardrailExternal or gatewayFilter (enforcement driver SPI)."
+                  x-kubernetes-validations:
+                    # Truthfulness invariant at spec level:
+                    # safety.required=true MUST NOT combine with enforcer.kind=none
+                    - rule: "!self.required || !has(self.enforcer) || self.enforcer.kind != 'none'"
+                      message: "safety.required=true cannot be combined with enforcer.kind=none (use required=false to opt out of enforcement)"
+
+                # ── Enforcement-driver credentials ──
+                # Neutral credential vocabulary lifted from ToolConfig. When
+                # safety.enforcer.enforcedAt federates to an external driver
+                # (agentgateway/muleSoftAiGateway) that requires client auth, the
+                # secret is referenced here — NEVER inlined. Additive + optional.
+                credentialProviderType:
+                  type: string
+                  enum: [NONE, providerManaged, API_KEY, OAUTH]
+                  default: NONE
+                  description: "Neutral credential scope for the enforcement driver. NONE | providerManaged (driver-injected identity) | API_KEY | OAUTH. Type only — actual secret in credentialSecretRef."
+                credentialSecretRef:
+                  type: string
+                  maxLength: 253
+                  description: "Name of Kubernetes Secret holding enforcement-driver credentials. Required when credentialProviderType is API_KEY or OAUTH. Credentials NEVER inline in CRD."
+
+                # ── Governance ──
+                governance:
+                  type: object
+                  description: "Governance metadata for this model: ownership, data-classification, lifecycle/retirement, and the optional approval gate. Drives admission checks and the discovery-catalog record."
+                  properties:
+                    owner: { type: string }
+                    costCenter: { type: string }
+                    dataClassification:
+                      type: string
+                      enum: [public, internal, confidential, pii, regulated, restricted]
+                    retirementDate:
+                      type: string
+                      format: date
+                    # ── Governance Approval Gate ──
+                    approval:
+                      type: object
+                      description: |
+                        Human/policy approval gate. When required=true,
+                        the operator parks the CR in phase=Reviewing until
+                        a signed attestation from the role declared in
+                        approverRole appears in status.governance.approvals[].
+                        Default for required flips on spec.safety.required so
+                        non-safety assets keep auto-approving.
+                      properties:
+                        required:
+                          type: boolean
+                          description: "When unset, defaults to spec.safety.required."
+                        requiredApprovals:
+                          type: integer
+                          minimum: 1
+                          default: 1
+                          description: "Number of role-matching attestations required (default 1)."
+                        approverRole:
+                          type: string
+                          description: |
+                            FQN role name (canonicalized). Defaults to
+                            modaas-modelconfig-<alias>-admin (the per-asset
+                            IdentityConfig provisions this role).
+                          maxLength: 253
+
+                # ── AWS Bedrock ──
+                awsBedrock:
+                  type: object
+                  description: "Provider-specific configuration when provider=aws-bedrock (region, guardrails, API mode, throughput). Exactly one provider block must match spec.provider (CEL-enforced)."
+                  required: [region]
+                  properties:
+                    region:
+                      type: string
+                      pattern: "^[a-z]{2}-[a-z]+-[0-9]+$"
+                    # ─── Bedrock API mode ───
+                    # Most Bedrock foundation models support Converse (the default).
+                    # Custom Model Import models whose architecture lacks Converse
+                    # support — notably Qwen3 (Qwen3ForCausalLM), e.g. the OTel-LLM
+                    # telco model — MUST be invoked via InvokeModel. Declare
+                    # apiMode: invokeModel to route the gateway accordingly.
+                    apiMode:
+                      type: string
+                      enum: [converse, invokeModel]
+                      default: converse
+                      description: "How the gateway invokes this Bedrock model. 'converse' (default) for standard foundation models; 'invokeModel' for Custom Model Import models whose architecture does not support the Converse API (e.g. some Qwen3 variants)."
+                    # ─── Provisioned Throughput pass-through ───
+                    # When declared, this ARN is used as the actual invocation model id
+                    # in place of modelId. Bedrock Converse / InvokeModel accept a
+                    # Provisioned Throughput ARN natively.
+                    provisionedThroughputArn:
+                      type: string
+                      description: "Optional: Provisioned Throughput ARN to use at invocation time instead of on-demand modelId."
+                      pattern: "^arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:provisioned-model/.+$"
+                    auth:
+                      type: object
+                      properties:
+                        method: { type: string, enum: [workloadIdentity, accessKey] }
+                        iamRoleArn: { type: string }
+                        k8sServiceAccount: { type: string }
+                    inferenceConfig:
+                      type: object
+                      properties:
+                        maxTokens: { type: integer, minimum: 1 }
+                        temperature: { type: number, minimum: 0, maximum: 2 }
+                        topP: { type: number, minimum: 0, maximum: 1 }
+                    guardrails:
+                      type: object
+                      properties:
+                        contentPolicy:
+                          type: object
+                          properties:
+                            filters:
+                              type: array
+                              items:
+                                type: object
+                                required: [type, inputStrength, outputStrength]
+                                properties:
+                                  type:
+                                    type: string
+                                    enum: [SEXUAL, VIOLENCE, HATE, INSULTS, MISCONDUCT, PROMPT_ATTACK]
+                                  inputStrength:
+                                    type: string
+                                    enum: [NONE, LOW, MEDIUM, HIGH]
+                                  outputStrength:
+                                    type: string
+                                    enum: [NONE, LOW, MEDIUM, HIGH]
+                        piiPolicy:
+                          type: object
+                          properties:
+                            entities:
+                              type: array
+                              items:
+                                type: object
+                                required: [type, action]
+                                properties:
+                                  type: { type: string }
+                                  action: { type: string, enum: [BLOCK, ANONYMIZE] }
+                        topicPolicy:
+                          type: object
+                          properties:
+                            topics:
+                              type: array
+                              items:
+                                type: object
+                                required: [name, definition, type]
+                                properties:
+                                  name: { type: string }
+                                  definition: { type: string }
+                                  examples:
+                                    type: array
+                                    items: { type: string }
+                                  type: { type: string, enum: [DENY] }
+                        contextualGroundingPolicy:
+                          type: object
+                          properties:
+                            filters:
+                              type: array
+                              items:
+                                type: object
+                                required: [type, threshold]
+                                properties:
+                                  type: { type: string, enum: [GROUNDING, RELEVANCE] }
+                                  threshold: { type: number, minimum: 0, maximum: 1 }
+                        wordPolicy:
+                          type: object
+                          description: "Custom word denylist + managed profanity filter. Maps to AWS wordPolicyConfig."
+                          properties:
+                            words:
+                              type: array
+                              description: "Custom words/phrases to block."
+                              items:
+                                type: object
+                                required: [text]
+                                properties:
+                                  text:
+                                    type: string
+                                    description: "Word or phrase to block (max 100 chars per AWS limits)"
+                                    maxLength: 100
+                            managedWordLists:
+                              type: array
+                              description: "AWS-managed word lists (currently only PROFANITY)."
+                              items:
+                                type: object
+                                required: [type]
+                                properties:
+                                  type: { type: string, enum: [PROFANITY] }
+                        blockedInputMessaging:
+                          type: string
+                          maxLength: 500
+                        blockedOutputsMessaging:
+                          type: string
+                          maxLength: 500
+                    observability:
+                      type: object
+                      properties:
+                        cloudWatch:
+                          type: object
+                          properties:
+                            invocationLoggingEnabled: { type: boolean }
+                            logGroupName: { type: string }
+
+                # ── AWS SageMaker ──
+                # Onboard-only: MoDaaS does NOT create or lifecycle SageMaker
+                # endpoints. The endpoint is owned by the ML platform team
+                # (CDK / SageMaker Studio / MLOps pipeline). MoDaaS validates
+                # the endpoint exists, captures governance metadata, provisions
+                # safety overlays (bedrockGuardrailExternal — SageMaker
+                # has no native guardrails), and routes inference traffic.
+                #
+                # IAM (small surface): operator needs sagemaker:Describe* +
+                # List*; gateway pod needs sagemaker:InvokeEndpoint. NO PassRole.
+                awsSageMaker:
+                  type: object
+                  description: "Provider-specific configuration when provider=aws-sagemaker (region, endpoint name). Onboard-only: validates an existing SageMaker endpoint. Exactly one provider block must match spec.provider (CEL-enforced)."
+                  required: [region, endpointName]
+                  properties:
+                    region:
+                      type: string
+                      pattern: "^[a-z]{2}-[a-z]+-[0-9]+$"
+                    endpointName:
+                      type: string
+                      description: "SageMaker endpoint name. Must already exist (managed externally)."
+                      pattern: "^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$"
+                    endpointArn:
+                      type: string
+                      description: "Optional but preferred — operator validates name resolves to this ARN. Provides immutable identity."
+                      pattern: "^arn:aws:sagemaker:[a-z0-9-]+:[0-9]{12}:endpoint/.+$"
+                    inferenceMode:
+                      type: string
+                      enum: [realtime, async, serverless]
+                      default: realtime
+                      description: "Operator validates against describe_endpoint_config.ProductionVariants."
+                    # I/O contract — container-defined
+                    ioFormat:
+                      type: string
+                      enum: [openai-chat, hf-tgi, hf-pytorch, vllm-openai, custom-jsonl]
+                      default: hf-tgi
+                      description: "How the gateway shapes requests and parses responses for this endpoint. Defaults to hf-tgi (HuggingFace Text Generation Inference wire format)."
+                    contentType:
+                      type: string
+                      default: "application/json"
+                    acceptType:
+                      type: string
+                      default: "application/json"
+                    # Auth: gateway pod IRSA only (no PassRole)
+                    auth:
+                      type: object
+                      properties:
+                        method:
+                          type: string
+                          enum: [workloadIdentity]
+                          default: workloadIdentity
+                          description: "Only IRSA supported. NO PassRole (onboard-only)."
+                        invokeRoleArn:
+                          type: string
+                          pattern: "^arn:aws:iam::[0-9]{12}:role/.+$"
+                          description: "Gateway pod IAM role with sagemaker:InvokeEndpoint scoped to this endpoint."
+                    # Provenance — informational metadata about who hosts this endpoint
+                    provenance:
+                      type: object
+                      description: "Discovery metadata. Not enforced; surfaced in Registry record for federated lineage."
+                      properties:
+                        createdBy: { type: string, maxLength: 256 }
+                        mlflowRunId: { type: string }
+                        modelArtifactS3Uri:
+                          type: string
+                          pattern: "^s3://.+"
+                        productionDate: { type: string, format: date }
+                    # Onboarding behavior — operator self-config
+                    onboarding:
+                      type: object
+                      properties:
+                        validateEndpointStatus:
+                          type: boolean
+                          default: true
+                          description: "Operator calls describe_endpoint and refuses approval if EndpointStatus != InService."
+                        validateContainerHealth:
+                          type: boolean
+                          default: false
+                          description: "Optional: HTTP HEAD <invocations>/ping if reachable."
+                        refusalOnDriftDetected:
+                          type: boolean
+                          default: true
+                          description: "If endpoint config diverges post-approval, mark CR Failed (governance signal)."
+
+                # ── Azure OpenAI ──
+                azureOpenAI:
+                  type: object
+                  description: "Provider-specific configuration when provider=azure-openai. Open-contract lane: realized by a sibling operator, not the AWS reference implementation. Exactly one provider block must match spec.provider (CEL-enforced)."
+                  properties:
+                    # endpoint moved to top-level spec.endpoint
+                    deploymentName: { type: string }
+                    apiVersion: { type: string }
+                    auth:
+                      type: object
+                      properties:
+                        method: { type: string, enum: [managedIdentity, apiKey] }
+                        secretRef:
+                          type: object
+                          properties:
+                            name: { type: string }
+                            namespace: { type: string }
+                    contentFilter:
+                      type: object
+                      properties:
+                        severity: { type: string, enum: [low, medium, high] }
+                        categories:
+                          type: array
+                          items: { type: string }
+
+                # ── Google Vertex AI ──
+                googleVertex:
+                  type: object
+                  description: "Provider-specific configuration when provider=google-vertex. Open-contract lane: realized by a sibling operator, not the AWS reference implementation. Exactly one provider block must match spec.provider (CEL-enforced)."
+                  properties:
+                    projectId: { type: string }
+                    location: { type: string }
+                    modelGardenRef: { type: string }
+                    auth:
+                      type: object
+                      properties:
+                        method: { type: string, enum: [workloadIdentity, serviceAccount] }
+                        serviceAccountEmail: { type: string }
+
+                # ── Databricks Mosaic AI ──
+                databricks:
+                  type: object
+                  description: "Provider-specific configuration when provider=databricks (workspace URL, serving endpoint). Open-contract lane: realized by a sibling operator, not the AWS reference implementation. Exactly one provider block must match spec.provider (CEL-enforced)."
+                  required: [workspaceUrl, servingEndpoint]
+                  properties:
+                    workspaceUrl:
+                      type: string
+                      pattern: "^https://.+"
+                    auth:
+                      type: object
+                      properties:
+                        method: { type: string, enum: [workloadIdentity, pat, spn] }
+                        secretRef:
+                          type: object
+                          properties:
+                            kind: { type: string, enum: [Secret] }
+                            name: { type: string }
+                            namespace: { type: string }
+                    servingEndpoint:
+                      type: object
+                      required: [name, endpointType]
+                      properties:
+                        name: { type: string }
+                        entity: { type: string, description: "Unity Catalog model: catalog.schema.model" }
+                        entityVersion: { type: string }
+                        endpointType:
+                          type: string
+                          enum: [foundationModel, externalModel, customModel, mosaicAgent]
+                        minProvisionedConcurrency: { type: integer, minimum: 0 }
+                    unityCatalog:
+                      type: object
+                      properties:
+                        catalog: { type: string }
+                        schema: { type: string }
+                        modelName: { type: string }
+                    gateway:
+                      type: object
+                      properties:
+                        usageTrackingEnabled: { type: boolean }
+                        payloadLoggingEnabled: { type: boolean }
+                        rateLimit:
+                          type: object
+                          properties:
+                            calls: { type: integer, minimum: 1 }
+                            renewalPeriod: { type: string, enum: [minute, hour, day] }
+                        guardrails:
+                          type: object
+                          properties:
+                            safety:
+                              type: object
+                              properties:
+                                enabled: { type: boolean }
+                                model: { type: string }
+                            pii:
+                              type: object
+                              properties:
+                                enabled: { type: boolean }
+                                action: { type: string, enum: [BLOCK, REDACT] }
+                                entities:
+                                  type: array
+                                  items: { type: string }
+
+                # ── NVIDIA NIM ──
+                nvidiaNIM:
+                  type: object
+                  description: "Provider-specific configuration when provider=nvidia-nim. Open-contract lane: realized by a sibling operator, not the AWS reference implementation. Exactly one provider block must match spec.provider (CEL-enforced)."
+                  properties:
+                    # endpoint moved to top-level spec.endpoint
+                    modelName: { type: string }
+                    auth:
+                      type: object
+                      properties:
+                        method: { type: string, enum: [apiKey, none] }
+                        secretRef:
+                          type: object
+                          properties:
+                            name: { type: string }
+                            namespace: { type: string }
+                    tls:
+                      type: object
+                      properties:
+                        insecureSkipVerify: { type: boolean, default: false }
+                        caBundleRef: { type: string }
+                    healthCheckPath:
+                      type: string
+                      default: "/v1/health/ready"
+
+                # ── Ollama ──
+                ollama:
+                  type: object
+                  description: "Provider-specific configuration when provider=ollama. Open-contract lane: realized by a sibling operator, not the AWS reference implementation. Exactly one provider block must match spec.provider (CEL-enforced)."
+                  properties:
+                    # endpoint moved to top-level spec.endpoint
+                    modelName: { type: string }
+                    pullOnCreate: { type: boolean, default: false }
+
+                # ── Custom (escape hatch) ──
+                custom:
+                  type: object
+                  description: "Provider-specific configuration when provider=custom (an OpenAI-compatible or bespoke endpoint). Open-contract escape hatch: realized by a sibling operator, not the AWS reference implementation. Exactly one provider block must match spec.provider (CEL-enforced)."
+                  properties:
+                    baseUrl: { type: string }
+                    authHeader: { type: string }
+                    authSecretRef: { type: string }
+                    protocol:
+                      type: string
+                      enum: [openai-compatible, anthropic-compatible, custom]
+
+            # ═════════════════════════════════════════════════════════════════
+            # STATUS
+            # ═════════════════════════════════════════════════════════════════
+            status:
+              type: object
+              x-kubernetes-validations:
+                # globalResourceEndpoint immutability rule is intentionally
+                # deferred — the field is still being shaped (path scheme, scope
+                # semantics) and operator drift corrections need to land. Re-add
+                # once a stable contract is published.
+                # Warn (not refuse) if globalResourceEndpoint missing when Approved
+                - rule: |
+                    !has(self.phase) || self.phase != 'Approved' || has(self.globalResourceEndpoint)
+                  message: "status.globalResourceEndpoint should be set when phase=Approved (advisory)"
+                # ── Admission CEL invariants (claim verification) ──
+                # Guardrail claim verifiability (enforced):
+                # safetyEnabled=true on Approval MUST be backed by both guardrailId
+                # and guardrailVersion. Without these, the "this asset is guarded"
+                # claim is unverifiable and silent-failure ships.
+                - rule: |
+                    !(has(self.phase) && self.phase == 'Approved')
+                    || !(has(self.safetyEnabled) && self.safetyEnabled == true)
+                    || (has(self.guardrailId) && size(self.guardrailId) > 0
+                        && has(self.guardrailVersion) && size(self.guardrailVersion) > 0)
+                  message: "safetyEnabled=true on Approval requires both status.guardrailId and status.guardrailVersion, otherwise the safety claim is unverifiable."
+                # Deferred: globalResourceEndpoint scope vs consumer requirements.
+                #   Activate once status.boundPublicConsumers (list) is added.
+                #   Intent: refuse Approved + endpointScope=mesh when public-vantage
+                #   consumers are bound. K8s CEL rejects unknown structural-schema
+                #   field paths even when has()-guarded, so this lands with the field.
+                # Deferred: IdentityProvisioned=True ↔ non-empty
+                #   status.identityConfigRef. Activate once identityConfigRef is
+                #   promoted into the status schema. Until then this is
+                #   operator-owned (claim sets condition only after provisioning succeeds).
+              properties:
+                # ── kopf handler results ─────────────────────────────────────────────
+                # kopf persists each handler's RETURN VALUE at status.<handler_id>. These were not
+                # declared, and status has no x-kubernetes-preserve-unknown-fields, so the API stripped
+                # them and every reconcile logged:
+                #   Patching failed with inconsistencies: (('remove', ('status','reconcile'), ...))
+                # That warning is identical whether the dropped field is kopf bookkeeping or a field the
+                # operator genuinely meant to publish, so a constant benign version of it cannot warn about
+                # the dangerous one. Declared explicitly rather than via preserve-unknown-fields so a
+                # genuinely mistyped status key still gets rejected.
+                reconcile:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for reconcile() — diagnostic, not API surface.
+                resync_from_registry:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for resync_from_registry() — diagnostic, not API surface.
+                scan_orphan_records:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for scan_orphan_records() — diagnostic, not API surface.
+                cleanup:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  description: kopf handler result for cleanup() — diagnostic, not API surface.
+                phase:
+                  type: string
+                  # Pending + Reviewing support the governance approval gate.
+                  # Pending is the entry state written by the operator before
+                  # structural validation; Reviewing is the gated state awaiting
+                  # human attestation.
+                  enum: [Pending, Reviewing, Validating, Validated, Configuring, Approved, Failed, Paused, Retired]
+                reason: { type: string, maxLength: 512 }
+                observedGeneration: { type: integer }
+                lastReconciled: { type: string, format: date-time }
+                resolvedModelId: { type: string }
+                guardrailId:
+                  type: string
+                  description: "Provider-native guardrail identifier written after successful provisioning"
+                guardrailVersion:
+                  type: string
+                  description: "Provider-native guardrail version"
+                modelClassifications:
+                  type: array
+                  description: "Resolved capability classifications verified by operator"
+                  items:
+                    type: string
+                    enum:
+                      - chat
+                      - reasoning
+                      - embedding
+                      - vision
+                      - tool-use
+                      - streaming
+                      - code-generation
+                      - structured-output
+                      - audio
+                      - time-series
+                      - rerank
+                modelType:
+                  type: string
+                  description: "Primary classification (first element of modelClassifications). Retained for printer column; prefer modelClassifications[] for full signal. Free-form: the operator derives it from spec.capabilities.features when declared, so it is NOT constrained to a fixed enum (a narrow enum would reject the status write for any author-declared feature outside the set)."
+                endpoint:
+                  type: string
+                  description: "Governed runtime URL agents MUST call. Per-wire-format path (e.g. .../sagemaker/endpoints/<alias>/invocations or .../bedrock/model/<alias>/converse). Status-driven discovery clients read THIS, not upstreamEndpoint, to stay on the governed path."
+                # Per-wire-format endpoint map {scope: url} the operator publishes
+                # alongside the chosen `endpoint`. Keys are dynamic scopes, so this
+                # is an open object — declared here so K8s does not silently strip
+                # the operator's write (it previously was, since only the singular
+                # `endpoint` was in the schema).
+                endpoints:
+                  type: object
+                  description: "Per-scope governed endpoint URLs the operator resolved for this asset (e.g. mesh/public). The single best one is mirrored to status.endpoint."
+                  x-kubernetes-preserve-unknown-fields: true
+                upstreamEndpoint:
+                  type: string
+                  description: "Raw provider URL behind the gateway (Bedrock/SageMaker/etc.). Diagnostics only — agents that call this directly bypass MoDaaS governance and enforcement."
+                safetyEnabled: { type: boolean }
+                # ── Enforcer observability ──
+                # Status enum kept in lockstep with the spec enum to prevent
+                # drift. bedrockGuardrailExternal added in forward-compat for
+                # provider-agnostic guardrail enforcement.
+                enforcerKind:
+                  type: string
+                  description: "Observed enforcer kind in effect. Mirrors spec.safety.enforcer.kind with legacy-fallback applied."
+                  enum: [bedrockGuardrail, bedrockGuardrailExternal, gatewayFilter, external, none]
+                # ── Observed enforcement driver ──
+                # Operator writes spec.safety.enforcer.enforcedAt here (default self).
+                # Declared in status schema so K8s does not silently strip the write.
+                enforcedAt:
+                  type: string
+                  description: "Observed enforcement driver in effect — mirrors spec.safety.enforcer.enforcedAt; self=MoDaaS AI Gateway."
+                  pattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+                  example: self
+                # When enforcerKind=bedrockGuardrailExternal, the gateway
+                # consumes the guardrail provisioning facts from these fields:
+                guardrailRegion:
+                  type: string
+                  description: "Bedrock control-plane region for ApplyGuardrail calls."
+                enforcerApplyTo:
+                  type: array
+                  description: "Which directions the gateway enforces for bedrockGuardrailExternal: [input,output]."
+                  items:
+                    type: string
+                    enum: [input, output]
+                enforcerEndpoint:
+                  type: string
+                  description: "Observed endpoint when enforcer.kind=external (echoed from spec for gateway consumption)."
+                enforcerTimeoutMs:
+                  type: integer
+                  description: "Observed timeoutMs when enforcer.kind=external."
+                enforcerFailOpen:
+                  type: boolean
+                  description: "Observed failOpen flag when enforcer.kind=external."
+                registryRecordId:
+                  type: string
+                  description: "Governance-registry record key. Convention: <provider>_<asset_id>, both halves normalized (lowercase, '_'->'-', leading-alpha) to prevent cross-provider collision. Unified pattern across ModelConfig/ToolConfig/AgentConfig."
+                  pattern: "^[a-z][a-z0-9-]*_[a-z][a-z0-9-]*$"
+                registryApprovalStatus:
+                  type: string
+                  description: "Observed registry state from timer-driven resync. MISSING indicates record deleted externally. UNKNOWN means registry was unreachable at last resync."
+                  enum: [APPROVED, DRAFT, PENDING, DEPRECATED, MISSING, UNKNOWN]
+                # ── Registry backing reference (status mirror) ──
+                registryBackingRef:
+                  type: object
+                  description: "Observed backing that received this asset's record at last reconcile."
+                  properties:
+                    name:
+                      type: string
+                      description: "Registry CR name that was resolved."
+                    backing:
+                      type: string
+                      description: "Backing kind (agentcore | tmf639 |...)."
+                    recordId:
+                      type: string
+                      description: "Backing-specific record id (e.g., AgentCore recordId)."
+                    observedAt:
+                      type: string
+                      format: date-time
+                registryLastObserved:
+                  type: string
+                  format: date-time
+                  description: "Wall-clock time of last resync from registry (written by @timer handler every 5 minutes)."
+                driftDetected:
+                  type: boolean
+                  description: "True when CR state contradicts registry state (e.g. CR phase=Approved but registry state=DEPRECATED)."
+                driftReason:
+                  type: string
+                  maxLength: 256
+                  description: "Short human-readable explanation when driftDetected=true."
+                tmf639ResourceId:
+                  type: string
+                  description: "TMF639 Resource ID from Canvas Resource Inventory v5. Populated on successful projection; empty when Canvas endpoint is read-only."
+                daysUntilRetirement:
+                  type: integer
+                  description: "Computed from spec.governance.retirementDate; negative if overdue"
+                # ── Global Resource Endpoint + scope ──
+                globalResourceEndpoint:
+                  type: string
+                  format: uri
+                  description: |
+                    Stable, externally-resolvable URL representing the governance perimeter
+                    for this asset. Set by operator on transition to Approved. Immutable
+                    thereafter. Format: https://<gateway-host>/<wire-format>/<asset-uid>.
+                    To become required once the field contract is stabilized.
+                endpointScope:
+                  type: string
+                  enum: [mesh, vpc, public]
+                  description: |
+                    Resolvable scope of globalResourceEndpoint. mesh = cluster-internal only;
+                    vpc = VPC-internal; public = externally addressable.
+                componentRef:
+                  type: object
+                  description: "Canvas Component CR that owns this asset (set by operator after Component emission)."
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    uid:
+                      type: string
+                tmf639Resource:
+                  type: object
+                  description: "TMF639 v5 Resource Inventory record this asset projects to."
+                  properties:
+                    id:
+                      type: string
+                      description: "Stable TMF639 resource ID."
+                    url:
+                      type: string
+                      format: uri
+                      description: "Direct URL to the TMF639 record (e.g., RI baseUrl + /resource/{id})."
+                audit:
+                  type: object
+                  description: "Addressable audit pointers for this asset."
+                  properties:
+                    logGroup:
+                      type: string
+                      description: "CloudWatch log group name."
+                    queryUrl:
+                      type: string
+                      format: uri
+                      description: "Pre-built CloudWatch Logs Insights query URL."
+                # ── Governance approval audit trail ──
+                governance:
+                  type: object
+                  description: "Governance approval state (Reviewing → Approved gate)."
+                  properties:
+                    approvals:
+                      type: array
+                      description: "Append-only list of signed approval attestations."
+                      items:
+                        type: object
+                        required: [subject, role, at]
+                        properties:
+                          subject:
+                            type: string
+                            description: "Approver identity (Keycloak preferred_username / sub)."
+                            maxLength: 253
+                          role:
+                            type: string
+                            description: "Realm role the approver wielded; matches spec.governance.approval.approverRole."
+                            maxLength: 253
+                          attestation:
+                            type: string
+                            description: "Free-form rationale text (audit)."
+                            maxLength: 2048
+                          signature:
+                            type: string
+                            description: "Optional signature / bearer token (full JWT verification reserved for a future iteration)."
+                            maxLength: 4096
+                          at:
+                            type: string
+                            format: date-time
+                            description: "ISO-8601 UTC timestamp of approval."
+                    awaitingSince:
+                      type: string
+                      format: date-time
+                      description: "Wall-clock time the CR entered Reviewing; cleared on Approved."
+                      nullable: true
+                    rejectedAt:
+                      type: string
+                      format: date-time
+                      description: "Set on Reviewing → Failed when refusal was structural."
+                      nullable: true
+                    rejectedReason:
+                      type: string
+                      maxLength: 256
+                      description: "Short refusal cause: DependencyMissing | EnforcementNotDeclared | EnforcerKindMismatch | BackendNotReachable | IdentityProvisioningFailed."
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: { type: string }
+                      status: { type: string, enum: ["True", "False", "Unknown"] }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string, format: date-time }
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - { name: Alias,    type: string,  jsonPath: .spec.alias }
+        - { name: Provider, type: string,  jsonPath: .spec.provider }
+        - { name: Type,     type: string,  jsonPath: .status.modelType }
+        - { name: Tier,     type: string,  jsonPath: .spec.capabilities.tier, priority: 1 }
+        - { name: Safety,   type: boolean, jsonPath: .status.safetyEnabled }
+        - { name: Enforcer, type: string,  jsonPath: .status.enforcerKind, priority: 1, description: "Enforcer kind in effect (bedrockGuardrail/external/none/gatewayFilter)" }
+        - { name: Phase,    type: string,  jsonPath: .status.phase }
+        - { name: Paused,   type: boolean, jsonPath: .spec.paused, priority: 1 }
+        - { name: Retire,   type: integer, jsonPath: .status.daysUntilRetirement, priority: 1 }
+        - { name: Reason,   type: string,  jsonPath: .status.reason, priority: 1 }
+        - { name: Reg,      type: string,  jsonPath: .status.registryApprovalStatus, priority: 1 }
+        - { name: Drift,    type: boolean, jsonPath: .status.driftDetected, priority: 1 }
+        - { name: Registry, type: string, jsonPath: .spec.registryRef.name, priority: 1 }
+        - { name: Global-Endpoint, type: string, jsonPath: .status.globalResourceEndpoint, priority: 1 }
+        - { name: Scope, type: string, jsonPath: .status.endpointScope, priority: 1 }
+
+        - { name: Age,      type: date,    jsonPath: .metadata.creationTimestamp }
