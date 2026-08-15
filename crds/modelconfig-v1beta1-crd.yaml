@@ -172,9 +172,9 @@ spec:
                 # Immutable after creation: silently re-homing an asset's records
                 # to a different catalog would orphan the prior registry's records
                 # and break audit provenance (same governance rationale as the
-                # identity triple). Optional field, so guard both has() sides.
-                - rule: "!has(oldSelf.registryRef) || !has(self.registryRef) || oldSelf.registryRef == self.registryRef"
-                  message: "spec.registryRef is immutable after creation"
+                # identity triple). Optional set-once field: may be set later if absent at create, never removed or re-pointed.
+                - rule: "!has(oldSelf.registryRef) || (has(self.registryRef) && oldSelf.registryRef == self.registryRef)"
+                  message: "spec.registryRef is immutable once set (removing or re-pointing it would orphan the prior catalog's records)"
                 # ── Endpoint semantics ──
                 # aws-bedrock: endpoint optional (operator derives from region).
                 # All other providers: endpoint required (no region-derivation path).

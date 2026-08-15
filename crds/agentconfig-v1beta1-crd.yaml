@@ -46,15 +46,21 @@ spec:
           required: ["spec"]
           x-kubernetes-validations:
             # Governance approval gate invariants
+            # Gate fires on EVERY serving phase: this kind's phase machine has a
+            # distinct Active (deployed/serving) state past Approved — without it
+            # in the trigger, a status writer could reach a serving state having
+            # never satisfied the approval gate. (ModelConfig has no Active phase;
+            # its gate correctly triggers on Approved alone.)
             - rule: |
-                !has(self.status) || !has(self.status.phase) || self.status.phase != 'Approved'
+                !has(self.status) || !has(self.status.phase)
+                || !(self.status.phase in ['Approved', 'Active'])
                 || !has(self.spec.governance) || !has(self.spec.governance.approval)
                 || !has(self.spec.governance.approval.required)
                 || self.spec.governance.approval.required != true
                 || (has(self.status.governance) && has(self.status.governance.approvals)
                     && size(self.status.governance.approvals) >=
                        (has(self.spec.governance.approval.requiredApprovals) ? self.spec.governance.approval.requiredApprovals : 1))
-              message: "phase=Approved with governance.approval.required=true requires at least requiredApprovals signed attestations in status.governance.approvals[] (governance approval gate)."
+              message: "a serving phase (Approved/Active) with governance.approval.required=true requires at least requiredApprovals attestations in status.governance.approvals[] (governance approval gate)."
             # Grandfather transition rule — demands approval only when the
             # safety-enforcement posture is newly set (create) or changed
             # (update). Pre-existing agents with unchanged safety are
@@ -94,6 +100,17 @@ spec:
                 - rule: |
                     !has(self.kubernetesPod) || self.provider == 'kubernetesPod'
                   message: "spec.kubernetesPod is only valid when spec.provider='kubernetesPod' (dual-provider hosting)"
+                - rule: |
+                    !has(self.awsAgentCore) || self.provider == 'awsAgentCore'
+                  message: "spec.awsAgentCore is only valid when spec.provider='awsAgentCore' (dual-provider hosting)"
+                # ── Enforcement-driver credential consistency ──
+                # Mirrors the ModelConfig/ToolConfig credential rules: a secret-
+                # bearing credential type requires a non-empty Secret reference.
+                - rule: |
+                    !has(self.credentialProviderType)
+                    || !(self.credentialProviderType in ['API_KEY', 'OAUTH'])
+                    || (has(self.credentialSecretRef) && self.credentialSecretRef != '')
+                  message: "credentialProviderType=API_KEY|OAUTH requires a non-empty credentialSecretRef pointing to a Kubernetes Secret"
                 # ── Network posture — provider-dispatched (neutrality fix) ──
                 # The AWS subnet/securityGroup requirement applies ONLY to
                 # provider=awsAgentCore. A kubernetesPod (or any non-AWS) agent
@@ -116,17 +133,33 @@ spec:
                 # registryRef selects the discovery-catalog backing (Registry CR).
                 # Immutable after creation: silently re-homing an asset's records
                 # to a different catalog would orphan the prior registry's records
-                # and break audit provenance. Optional field, guard both has() sides.
-                - rule: "!has(oldSelf.registryRef) || !has(self.registryRef) || oldSelf.registryRef == self.registryRef"
-                  message: "spec.registryRef is immutable after creation"
+                # and break audit provenance. Optional set-once field: may be set later if absent at create, never removed or re-pointed.
+                - rule: "!has(oldSelf.registryRef) || (has(self.registryRef) && oldSelf.registryRef == self.registryRef)"
+                  message: "spec.registryRef is immutable once set (removing or re-pointing it would orphan the prior catalog's records)"
                 # ── Cross-vendor neutrality rules ──
-                - rule: "!has(self.modelRef) || !has(self.dependsOn) || !has(self.dependsOn.models) || self.modelRef in self.dependsOn.models"
-                  message: "spec.modelRef must appear in spec.dependsOn.models for cross-asset dep gate to resolve"
-                # toolRefs ⊆ dependsOn.tools enforced at admission.
+                # modelRef is a projection of one dependsOn.models entry ("lifted
+                # from dependsOn.models"), so declaring it REQUIRES the dependsOn
+                # declaration — previously the !has(dependsOn) guard allowed a
+                # modelRef with no dependency edge, silently bypassing the
+                # cross-asset dep gate. Grandfather: unchanged specs pass
+                # (operator status-touch / annotate re-apply never rejected).
+                - rule: |
+                    (oldSelf.hasValue() && oldSelf.value() == self)
+                    || !has(self.modelRef)
+                    || (has(self.dependsOn) && has(self.dependsOn.models) && self.modelRef in self.dependsOn.models)
+                  optionalOldSelf: true
+                  message: "spec.modelRef must appear in spec.dependsOn.models (declaring modelRef requires the dependsOn.models dependency edge)"
+                # toolRefs ⊆ dependsOn.tools enforced at admission — declaring
+                # toolRefs REQUIRES the dependsOn.tools declaration (same
+                # projection semantics as modelRef).
                 # The K8s 1.30+ cost budget accommodates self.toolRefs.all() over maxItems:50.
                 # An operator-side check remains as defense-in-depth.
-                - rule: "!has(self.toolRefs) || !has(self.dependsOn) || !has(self.dependsOn.tools) || self.toolRefs.all(t, t in self.dependsOn.tools)"
-                  message: "every entry in spec.toolRefs must appear in spec.dependsOn.tools (cross-asset dep gate cannot resolve undeclared tool)"
+                - rule: |
+                    (oldSelf.hasValue() && oldSelf.value() == self)
+                    || !has(self.toolRefs) || size(self.toolRefs) == 0
+                    || (has(self.dependsOn) && has(self.dependsOn.tools) && self.toolRefs.all(t, t in self.dependsOn.tools))
+                  optionalOldSelf: true
+                  message: "every entry in spec.toolRefs must appear in spec.dependsOn.tools (declaring toolRefs requires the dependsOn.tools dependency edges)"
               properties:
                 # ── Identity ──
                 agentName:
@@ -647,6 +680,14 @@ spec:
                   x-kubernetes-validations:
                     - rule: "has(self.agentRuntimeId) || (has(self.containerUri) && has(self.roleArn))"
                       message: "awsAgentCore requires either agentRuntimeId (import) or containerUri+roleArn (managed)"
+                    # Import and managed modes are mutually exclusive — a block
+                    # carrying both leaves the operator's mode dispatch ambiguous.
+                    # Grandfather: an unchanged block passes (ratchet on edit/create).
+                    - rule: |
+                        (oldSelf.hasValue() && oldSelf.value() == self)
+                        || !(has(self.agentRuntimeId) && has(self.containerUri))
+                      optionalOldSelf: true
+                      message: "awsAgentCore.agentRuntimeId (import mode) and awsAgentCore.containerUri (managed mode) are mutually exclusive; declare exactly one hosting mode"
 
                 # ── Kubernetes Pod hosting ──
                 # Required when spec.provider=kubernetesPod. The operator creates a
