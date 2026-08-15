@@ -184,7 +184,7 @@ spec:
                     Both providers honor the same dependsOn semantics, governance metadata,
                     safety attestation (composition truthfulness invariant), and Registry
                     projection. The operator dispatches on this field. As an open contract with
-                    an opinionated AWS reference implementation, the schema permits ANY lowercase
+                    an opinionated AWS reference implementation, the schema permits any leading-lowercase
                     alphanumeric provider id so sibling operators can register additional
                     providers without a CRD bump.
                   pattern: "^[a-z][a-zA-Z0-9-]*$"
@@ -840,6 +840,10 @@ spec:
                 phase:
                   type: string
                   # Reviewing sits between Pending and Approved (governance approval gate).
+                  # Phase machines intentionally differ per asset kind: an agent has
+                  # real infrastructure to bring up after governance passes, so
+                  # Approved (governance passed) and Active (runtime hosted, serving)
+                  # are distinct states.
                   enum: [Pending, Reviewing, Approved, Active, Failed, Paused, Retired]
                 reason: { type: string, maxLength: 512 }
                 observedGeneration: { type: integer }
@@ -1046,7 +1050,7 @@ spec:
                 # K8s silently strips the boolean.
                 dependencyHealthy:
                   type: boolean
-                  description: "Cascade observability — top-level convenience scalar mirroring the DependencyHealthy condition. True iff every dependency is Approved+Active."
+                  description: "Cascade observability — top-level convenience scalar mirroring the DependencyHealthy condition. True iff every dependency has reached its kind's serving state (ModelConfig: Approved — models have no Active phase; ToolConfig: Active)."
                 # ── Agent-Action Policy status mirror ──
                 # The operator publishes the engine selected, the PDP location,
                 # readiness of the PDP, and lightweight decision counters for

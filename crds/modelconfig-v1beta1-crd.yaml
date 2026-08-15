@@ -879,10 +879,12 @@ spec:
                 # deferred — the field is still being shaped (path scheme, scope
                 # semantics) and operator drift corrections need to land. Re-add
                 # once a stable contract is published.
-                # Warn (not refuse) if globalResourceEndpoint missing when Approved
+                # Enforced: phase=Approved requires globalResourceEndpoint in the
+                # same status update. CRD validation rules cannot warn — a failing
+                # rule always rejects the write.
                 - rule: |
                     !has(self.phase) || self.phase != 'Approved' || has(self.globalResourceEndpoint)
-                  message: "status.globalResourceEndpoint should be set when phase=Approved (advisory)"
+                  message: "status.globalResourceEndpoint must be set when phase=Approved (write endpoint and phase in the same status update)"
                 # ── Admission CEL invariants (claim verification) ──
                 # Guardrail claim verifiability (enforced):
                 # safetyEnabled=true on Approval MUST be backed by both guardrailId
@@ -929,6 +931,10 @@ spec:
                   # Pending is the entry state written by the operator before
                   # structural validation; Reviewing is the gated state awaiting
                   # human attestation.
+                  # Phase machines intentionally differ per asset kind: a model's
+                  # onboarding validates the provider modelId and provisions the
+                  # guardrail (Validating/Validated/Configuring); there is no runtime
+                  # to activate, so Approved IS the serving state (no Active phase).
                   enum: [Pending, Reviewing, Validating, Validated, Configuring, Approved, Failed, Paused, Retired]
                 reason: { type: string, maxLength: 512 }
                 observedGeneration: { type: integer }
@@ -1127,7 +1133,7 @@ spec:
                             maxLength: 2048
                           signature:
                             type: string
-                            description: "Optional signature / bearer token (full JWT verification reserved for a future iteration)."
+                            description: "Optional detached signature over (subject, role, at). MUST NOT contain reusable credential material such as bearer tokens or JWTs with live audiences — status is readable by any principal with get on the CR. Full signature verification reserved for a future iteration."
                             maxLength: 4096
                           at:
                             type: string

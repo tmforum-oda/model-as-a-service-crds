@@ -254,7 +254,7 @@ spec:
                 credentialSecretRef:
                   type: string
                   maxLength: 253
-                  description: "Name of Kubernetes Secret holding credentials. Required when credentialProviderType != NONE and != GATEWAY_IAM_ROLE. Credentials NEVER inline in CRD."
+                  description: "Name of Kubernetes Secret holding credentials. Required (non-empty) when credentialProviderType is API_KEY or OAUTH; NONE, providerManaged and GATEWAY_IAM_ROLE are broker-injected and take no secretRef. Credentials NEVER inline in CRD."
                 dependsOn:
                   type: object
                   description: "Cross-asset dependency declarations. Operator gates approval until all refs exist and are Approved."
@@ -617,10 +617,12 @@ spec:
                 # globalResourceEndpoint immutability rule deferred — the field is
                 # still being shaped (path scheme, scope semantics) and operator drift
                 # corrections need to land. Re-add once a stable contract is published.
-                # Warn (not refuse) if globalResourceEndpoint missing when Approved
+                # Enforced: CEL has no warn modality, so this rule hard-rejects. The
+                # operator MUST write phase + globalResourceEndpoint in the same
+                # patch.status call.
                 - rule: |
                     !has(self.phase) || self.phase != 'Approved' || has(self.globalResourceEndpoint)
-                  message: "status.globalResourceEndpoint should be set when phase=Approved (warning only)"
+                  message: "status.globalResourceEndpoint must be set when phase=Approved (operator must write both in the same status patch)"
                 # ── Claim-verification admission CEL invariants ──
                 # Deferred: globalResourceEndpoint scope vs consumers.
                 #   Activate once status.boundPublicConsumers (list) is added.
@@ -653,6 +655,10 @@ spec:
                 phase:
                   type: string
                   # Reviewing added between Pending and Approved.
+                  # Phase machines intentionally differ per asset kind: a tool is
+                  # wired into a backing gateway after governance passes, so
+                  # Approved (governance passed) and Active (gateway target wired,
+                  # serving) are distinct states.
                   enum: [Pending, Reviewing, Approved, Active, Failed, Paused, Retired]
                 reason: { type: string, maxLength: 512 }
                 observedGeneration: { type: integer }

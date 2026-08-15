@@ -10,8 +10,9 @@
 
 MoDaaS (Model-as-a-Service) is a governance contract for AI models, tools, and
 agents running on the ODA Canvas. It expresses that contract as four
-namespace-scoped Kubernetes Custom Resource Definitions plus a discovery Registry,
-reconciled by operators.
+namespace-scoped Kubernetes Custom Resource Definitions — three governed-asset
+CRDs (ModelConfig, ToolConfig, AgentConfig) plus a discovery Registry — reconciled
+by operators.
 
 This folder contains the **open contract only** — the declarative schemas and the
 interaction flows. It contains no operator source code.
@@ -41,11 +42,12 @@ The contract is provider-neutral by construction:
   multiple provider operators coexist on one cluster.
 
 **Honest disclosure.** The shipped ModelConfig schema defines typed provider blocks
-for seven providers: `awsBedrock`, `azureOpenAI`, `googleVertex`, `databricks`,
-`nvidiaNIM`, `ollama`, and `custom`. The contract is multi-provider in the schema
-itself, not just in principle. What differs today is the *operator*: AWS is the one
-provider with a wired reference operator; the other blocks are realized by sibling
-operators under the same one-block-plus-CEL convention (no CRD change). The
+for eight providers: `awsBedrock`, `awsSageMaker`, `azureOpenAI`, `googleVertex`,
+`databricks`, `nvidiaNIM`, `ollama`, and `custom`. The contract is multi-provider in
+the schema itself, not just in principle. What differs today is the *operator*: AWS
+is the one vendor with a wired reference operator (covering both the `awsBedrock`
+and `awsSageMaker` paths); the other blocks are realized by sibling operators under
+the same one-block-plus-CEL convention (no CRD change). The
 prominence of AWS in the reference implementation reflects which operator exists
 today, not a design preference in the contract.
 
