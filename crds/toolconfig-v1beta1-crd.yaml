@@ -46,15 +46,21 @@ spec:
           required: ["spec"]
           x-kubernetes-validations:
             # Governance approval gate invariants
+            # Gate fires on EVERY serving phase: this kind's phase machine has a
+            # distinct Active (deployed/serving) state past Approved — without it
+            # in the trigger, a status writer could reach a serving state having
+            # never satisfied the approval gate. (ModelConfig has no Active phase;
+            # its gate correctly triggers on Approved alone.)
             - rule: |
-                !has(self.status) || !has(self.status.phase) || self.status.phase != 'Approved'
+                !has(self.status) || !has(self.status.phase)
+                || !(self.status.phase in ['Approved', 'Active'])
                 || !has(self.spec.governance) || !has(self.spec.governance.approval)
                 || !has(self.spec.governance.approval.required)
                 || self.spec.governance.approval.required != true
                 || (has(self.status.governance) && has(self.status.governance.approvals)
                     && size(self.status.governance.approvals) >=
                        (has(self.spec.governance.approval.requiredApprovals) ? self.spec.governance.approval.requiredApprovals : 1))
-              message: "phase=Approved with governance.approval.required=true requires at least requiredApprovals signed attestations in status.governance.approvals[] (governance approval gate)."
+              message: "a serving phase (Approved/Active) with governance.approval.required=true requires at least requiredApprovals attestations in status.governance.approvals[] (governance approval gate)."
             # Grandfather transition rule — demands approval only when the safety
             # posture is newly set (create) or changed (update). Pre-existing CRs
             # with unchanged safety are grandfathered, so admission never rejects
@@ -99,12 +105,12 @@ spec:
                 # registryRef selects the discovery-catalog backing (Registry CR).
                 # Immutable after creation: silently re-homing an asset's records
                 # to a different catalog would orphan the prior registry's records
-                # and break audit provenance. Optional field, guard both has() sides.
-                - rule: "!has(oldSelf.registryRef) || !has(self.registryRef) || oldSelf.registryRef == self.registryRef"
-                  message: "spec.registryRef is immutable after creation"
+                # and break audit provenance. Optional set-once field: may be set later if absent at create, never removed or re-pointed.
+                - rule: "!has(oldSelf.registryRef) || (has(self.registryRef) && oldSelf.registryRef == self.registryRef)"
+                  message: "spec.registryRef is immutable once set (removing or re-pointing it would orphan the prior catalog's records)"
                 # ── Cross-vendor neutrality rules (v1beta1 additive) ──
-                - rule: "!has(self.credentialProviderType) || self.credentialProviderType == 'NONE' || self.credentialProviderType == 'providerManaged' || self.credentialProviderType == 'GATEWAY_IAM_ROLE' || has(self.credentialSecretRef)"
-                  message: "credentialProviderType=API_KEY|OAUTH requires credentialSecretRef pointing to a Kubernetes Secret (NONE/providerManaged/GATEWAY_IAM_ROLE are broker-injected, no secretRef needed)"
+                - rule: "!has(self.credentialProviderType) || self.credentialProviderType == 'NONE' || self.credentialProviderType == 'providerManaged' || self.credentialProviderType == 'GATEWAY_IAM_ROLE' || (has(self.credentialSecretRef) && self.credentialSecretRef != '')"
+                  message: "credentialProviderType=API_KEY|OAUTH requires a non-empty credentialSecretRef pointing to a Kubernetes Secret (NONE/providerManaged/GATEWAY_IAM_ROLE are broker-injected, no secretRef needed)"
                 - rule: "!has(self.toolType) || self.toolType != 'openapi' || has(self.backendRef)"
                   message: "toolType=openapi requires backendRef (typically an s3:// URI to OpenAPI spec)"
                 - rule: "!has(self.toolType) || self.toolType != 'smithy' || has(self.backendRef)"
@@ -248,7 +254,7 @@ spec:
                 credentialSecretRef:
                   type: string
                   maxLength: 253
-                  description: "Name of Kubernetes Secret holding credentials. Required when credentialProviderType != NONE and != GATEWAY_IAM_ROLE. Credentials NEVER inline in CRD."
+                  description: "Name of Kubernetes Secret holding credentials. Required (non-empty) when credentialProviderType is API_KEY or OAUTH; NONE, providerManaged and GATEWAY_IAM_ROLE are broker-injected and take no secretRef. Credentials NEVER inline in CRD."
                 dependsOn:
                   type: object
                   description: "Cross-asset dependency declarations. Operator gates approval until all refs exist and are Approved."
@@ -611,10 +617,12 @@ spec:
                 # globalResourceEndpoint immutability rule deferred — the field is
                 # still being shaped (path scheme, scope semantics) and operator drift
                 # corrections need to land. Re-add once a stable contract is published.
-                # Warn (not refuse) if globalResourceEndpoint missing when Approved
+                # Enforced: CEL has no warn modality, so this rule hard-rejects. The
+                # operator MUST write phase + globalResourceEndpoint in the same
+                # patch.status call.
                 - rule: |
                     !has(self.phase) || self.phase != 'Approved' || has(self.globalResourceEndpoint)
-                  message: "status.globalResourceEndpoint should be set when phase=Approved (warning only)"
+                  message: "status.globalResourceEndpoint must be set when phase=Approved (operator must write both in the same status patch)"
                 # ── Claim-verification admission CEL invariants ──
                 # Deferred: globalResourceEndpoint scope vs consumers.
                 #   Activate once status.boundPublicConsumers (list) is added.
@@ -647,6 +655,10 @@ spec:
                 phase:
                   type: string
                   # Reviewing added between Pending and Approved.
+                  # Phase machines intentionally differ per asset kind: a tool is
+                  # wired into a backing gateway after governance passes, so
+                  # Approved (governance passed) and Active (gateway target wired,
+                  # serving) are distinct states.
                   enum: [Pending, Reviewing, Approved, Active, Failed, Paused, Retired]
                 reason: { type: string, maxLength: 512 }
                 observedGeneration: { type: integer }
